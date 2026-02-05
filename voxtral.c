@@ -262,6 +262,17 @@ void vox_free(vox_ctx_t *ctx) {
     free(ctx->enc_kv_cache_k);
     free(ctx->enc_kv_cache_v);
     free(ctx->ada_scale);
+    free(ctx->enc_inc_x_norm);
+    free(ctx->enc_inc_q);
+    free(ctx->enc_inc_k);
+    free(ctx->enc_inc_v);
+    free(ctx->enc_inc_attn_out);
+    free(ctx->enc_inc_proj_out);
+    free(ctx->enc_inc_gate);
+    free(ctx->enc_inc_up);
+    free(ctx->enc_inc_ffn_out);
+    free(ctx->enc_inc_positions);
+    free(ctx->enc_inc_rope_freqs);
 
     /* Persistent decoder buffers */
     free(ctx->dec_x);
@@ -510,14 +521,6 @@ static float *stream_conv_stem(vox_stream_t *s, const float *mel_new,
             for (int m = 0; m < VOX_MEL_BINS; m++)
                 s->mel_tail[m * 2 + (2 - tail_count + f)] = mel_new[(tail_start + f) * VOX_MEL_BINS + m];
 
-        /* Save last 2 conv0 frames from the full output */
-        int c0_tail_start = conv0_full_len >= 2 ? conv0_full_len - 2 : 0;
-        int c0_tail_count = conv0_full_len >= 2 ? 2 : conv0_full_len;
-        memset(s->conv0_tail, 0, (size_t)dim * 2 * sizeof(float));
-        for (int f = 0; f < c0_tail_count; f++)
-            for (int d = 0; d < dim; d++)
-                s->conv0_tail[d * 2 + (2 - c0_tail_count + f)] = conv0_out_full[d * conv0_full_len + c0_tail_start + f];
-
         /* Prepend conv0_tail (2 frames) to new conv0 outputs for conv1 */
         int padded_conv0_len = 2 + conv0_new_len;
         float *conv0_padded = (float *)malloc((size_t)dim * padded_conv0_len * sizeof(float));
@@ -528,9 +531,10 @@ static float *stream_conv_stem(vox_stream_t *s, const float *mel_new,
                 conv0_padded[d * padded_conv0_len + 2 + f] = conv0_out_full[d * conv0_full_len + 2 + f];
         }
 
-        /* Actually save the conv0_tail AFTER copying, using the padded conv0 data */
-        c0_tail_start = padded_conv0_len >= 2 ? padded_conv0_len - 2 : 0;
-        c0_tail_count = padded_conv0_len >= 2 ? 2 : padded_conv0_len;
+        /* Update conv0_tail for next chunk from current padded conv0 input. */
+        int c0_tail_start = padded_conv0_len >= 2 ? padded_conv0_len - 2 : 0;
+        int c0_tail_count = padded_conv0_len >= 2 ? 2 : padded_conv0_len;
+        memset(s->conv0_tail, 0, (size_t)dim * 2 * sizeof(float));
         for (int f = 0; f < c0_tail_count; f++)
             for (int d = 0; d < dim; d++)
                 s->conv0_tail[d * 2 + (2 - c0_tail_count + f)] = conv0_padded[d * padded_conv0_len + c0_tail_start + f];

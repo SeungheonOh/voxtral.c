@@ -184,6 +184,14 @@ typedef struct {
     int enc_kv_cache_max;     /* allocated capacity */
     int enc_kv_pos_offset;    /* logical offset from rolling compaction */
 
+    /* Persistent incremental-encoder scratch (allocated/grown on demand). */
+    int enc_inc_cap;          /* max new_len supported by buffers below */
+    float *enc_inc_x_norm, *enc_inc_q, *enc_inc_k, *enc_inc_v;
+    float *enc_inc_attn_out, *enc_inc_proj_out;
+    float *enc_inc_gate, *enc_inc_up, *enc_inc_ffn_out;
+    int *enc_inc_positions;
+    float *enc_inc_rope_freqs;
+
     /* Persistent single-token decoder buffers (allocated on first forward) */
     float *dec_x, *dec_x_norm, *dec_q, *dec_k, *dec_v;
     float *dec_attn_out, *dec_proj_out;

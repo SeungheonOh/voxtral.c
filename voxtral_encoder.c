@@ -363,6 +363,46 @@ static void enc_kv_cache_compact(vox_ctx_t *ctx) {
     ctx->enc_kv_cache_len = keep;
 }
 
+static int enc_realloc_float(float **ptr, size_t elems) {
+    float *tmp = (float *)realloc(*ptr, elems * sizeof(float));
+    if (!tmp) return -1;
+    *ptr = tmp;
+    return 0;
+}
+
+static int enc_realloc_int(int **ptr, size_t elems) {
+    int *tmp = (int *)realloc(*ptr, elems * sizeof(int));
+    if (!tmp) return -1;
+    *ptr = tmp;
+    return 0;
+}
+
+/* Grow persistent incremental-encoder scratch buffers for new_len positions. */
+static int enc_inc_ensure_buffers(vox_ctx_t *ctx, int new_len) {
+    if (new_len <= ctx->enc_inc_cap) return 0;
+
+    int dim = VOX_ENC_DIM;
+    int head_dim = VOX_ENC_HEAD_DIM;
+    int qkv_dim = VOX_ENC_HEADS * VOX_ENC_HEAD_DIM;
+    int hidden = VOX_ENC_HIDDEN;
+    size_t rope_elems = (size_t)new_len * (head_dim / 2) * 2;
+
+    if (enc_realloc_float(&ctx->enc_inc_x_norm, (size_t)new_len * dim) != 0) return -1;
+    if (enc_realloc_float(&ctx->enc_inc_q, (size_t)new_len * qkv_dim) != 0) return -1;
+    if (enc_realloc_float(&ctx->enc_inc_k, (size_t)new_len * qkv_dim) != 0) return -1;
+    if (enc_realloc_float(&ctx->enc_inc_v, (size_t)new_len * qkv_dim) != 0) return -1;
+    if (enc_realloc_float(&ctx->enc_inc_attn_out, (size_t)new_len * qkv_dim) != 0) return -1;
+    if (enc_realloc_float(&ctx->enc_inc_proj_out, (size_t)new_len * dim) != 0) return -1;
+    if (enc_realloc_float(&ctx->enc_inc_gate, (size_t)new_len * hidden) != 0) return -1;
+    if (enc_realloc_float(&ctx->enc_inc_up, (size_t)new_len * hidden) != 0) return -1;
+    if (enc_realloc_float(&ctx->enc_inc_ffn_out, (size_t)new_len * dim) != 0) return -1;
+    if (enc_realloc_int(&ctx->enc_inc_positions, (size_t)new_len) != 0) return -1;
+    if (enc_realloc_float(&ctx->enc_inc_rope_freqs, rope_elems) != 0) return -1;
+
+    ctx->enc_inc_cap = new_len;
+    return 0;
+}
+
 /* ========================================================================
  * Incremental Encoder Forward Pass
  * ======================================================================== */
@@ -395,25 +435,31 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
         fprintf(stderr, "  Encoder incremental: %d new positions (cache: %d, offset: %d)\n",
                 new_len, cache_len, ctx->enc_kv_pos_offset);
 
-    /* Working buffers for new positions only */
+    /* Output/working state for new positions */
     float *x = (float *)malloc((size_t)new_len * dim * sizeof(float));
+    if (!x) { *out_len = 0; return NULL; }
     memcpy(x, x_new, (size_t)new_len * dim * sizeof(float));
 
-    float *x_norm = (float *)malloc((size_t)new_len * dim * sizeof(float));
-    float *q = (float *)malloc((size_t)new_len * qkv_dim * sizeof(float));
-    float *k = (float *)malloc((size_t)new_len * qkv_dim * sizeof(float));
-    float *v = (float *)malloc((size_t)new_len * qkv_dim * sizeof(float));
-    float *attn_out = (float *)malloc((size_t)new_len * qkv_dim * sizeof(float));
-    float *proj_out = (float *)malloc((size_t)new_len * dim * sizeof(float));
-    float *gate = (float *)malloc((size_t)new_len * hidden * sizeof(float));
-    float *up = (float *)malloc((size_t)new_len * hidden * sizeof(float));
-    float *ffn_out = (float *)malloc((size_t)new_len * dim * sizeof(float));
+    if (enc_inc_ensure_buffers(ctx, new_len) != 0) {
+        free(x);
+        *out_len = 0;
+        return NULL;
+    }
+    float *x_norm = ctx->enc_inc_x_norm;
+    float *q = ctx->enc_inc_q;
+    float *k = ctx->enc_inc_k;
+    float *v = ctx->enc_inc_v;
+    float *attn_out = ctx->enc_inc_attn_out;
+    float *proj_out = ctx->enc_inc_proj_out;
+    float *gate = ctx->enc_inc_gate;
+    float *up = ctx->enc_inc_up;
+    float *ffn_out = ctx->enc_inc_ffn_out;
 
     /* RoPE frequencies for logical positions */
     int logical_start = ctx->enc_kv_pos_offset + cache_len;
-    int *positions = (int *)malloc((size_t)new_len * sizeof(int));
+    int *positions = ctx->enc_inc_positions;
     for (int i = 0; i < new_len; i++) positions[i] = logical_start + i;
-    float *rope_freqs = (float *)malloc((size_t)new_len * (head_dim / 2) * 2 * sizeof(float));
+    float *rope_freqs = ctx->enc_inc_rope_freqs;
     vox_compute_rope_freqs(rope_freqs, positions, new_len, head_dim, VOX_ROPE_THETA);
 
     for (int layer = 0; layer < VOX_ENC_LAYERS; layer++) {
@@ -517,12 +563,6 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
 
     /* Update cache length */
     ctx->enc_kv_cache_len = cache_len + new_len;
-
-    /* Clean up */
-    free(x_norm); free(q); free(k); free(v);
-    free(attn_out); free(proj_out);
-    free(gate); free(up); free(ffn_out);
-    free(positions); free(rope_freqs);
 
     *out_len = new_len;
     return x;
