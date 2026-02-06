@@ -104,6 +104,54 @@ kernel void mul_inplace(
     if (gid < uint(n)) a[gid] *= b[gid];
 }
 
+/* x[i] *= (1 + scale[i]) — adaptive RMS norm conditioning */
+kernel void ada_scale_mul(
+    device float *x [[buffer(0)]],
+    device const float *scale [[buffer(1)]],
+    constant int &n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < uint(n)) x[gid] *= (1.0f + scale[gid]);
+}
+
+/* ========================================================================
+ * Argmax over a float array. Returns index of max value.
+ * One threadgroup, result written to out[0].
+ * ======================================================================== */
+
+kernel void argmax_f32(
+    device const float *data [[buffer(0)]],
+    device int *out [[buffer(1)]],
+    constant int &n [[buffer(2)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]]
+) {
+    threadgroup float shared_val[256];
+    threadgroup int shared_idx[256];
+
+    float best_val = -INFINITY;
+    int best_idx = 0;
+    for (int i = tid; i < n; i += threads) {
+        float v = data[i];
+        if (v > best_val) { best_val = v; best_idx = i; }
+    }
+    shared_val[tid] = best_val;
+    shared_idx[tid] = best_idx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            if (shared_val[tid + stride] > shared_val[tid]) {
+                shared_val[tid] = shared_val[tid + stride];
+                shared_idx[tid] = shared_idx[tid + stride];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) out[0] = shared_idx[0];
+}
+
 /* ========================================================================
  * Causal masked softmax for attention scores.
  * scores: [n_heads, seq_q, seq_k] (contiguous per head)

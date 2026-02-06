@@ -64,6 +64,18 @@ void vox_metal_fused_qkv_bf16(int M, int K,
                                 float *q, float *k, float *v);
 
 /*
+ * Fused RMSNorm + QKV: norm + three matmuls in one command buffer.
+ * x_norm = rms_norm(x, norm_weight, eps), then QKV projections.
+ */
+void vox_metal_fused_norm_qkv_bf16(int M, int K,
+                                     const float *x,
+                                     const float *norm_weight, float eps,
+                                     const uint16_t *wq_bf16, int Nq,
+                                     const uint16_t *wk_bf16, int Nk,
+                                     const uint16_t *wv_bf16, int Nv,
+                                     float *q, float *k, float *v);
+
+/*
  * Fused SwiGLU FFN: w1+w3+silu+mul+w2 in one command buffer.
  * gate = silu(input @ w1^T)
  * up = input @ w3^T
@@ -77,6 +89,27 @@ void vox_metal_fused_ffn_bf16(int M, int dim, int hidden,
                                const uint16_t *w3_bf16,
                                const uint16_t *w2_bf16,
                                float *output);
+
+/*
+ * Fused wo projection + residual + RMSNorm + ada_scale + SwiGLU FFN + residual.
+ * All in one command buffer. Saves 1 round-trip per layer vs separate wo + FFN.
+ *
+ * attn_out[M, q_dim]: attention output (input for wo)
+ * wo_bf16[dim, q_dim]: output projection weights
+ * x[M, dim]: current residual (modified in-place: += wo_out, then += ffn_out)
+ * ffn_norm[dim]: RMS norm weights for FFN
+ * ada_scale[dim]: adaptive conditioning (NULL to skip)
+ * w1,w3,w2: FFN weights
+ */
+void vox_metal_fused_wo_ffn_bf16(int M, int dim, int q_dim, int hidden,
+                                   float *x,
+                                   const float *attn_out,
+                                   const uint16_t *wo_bf16,
+                                   const float *ffn_norm, float eps,
+                                   const float *ada_scale,
+                                   const uint16_t *w1_bf16,
+                                   const uint16_t *w3_bf16,
+                                   const uint16_t *w2_bf16);
 
 /*
  * GPU batched attention (all heads in one command buffer).
@@ -94,6 +127,17 @@ void vox_metal_batched_attention(float *out,
                                   int n_heads, int n_kv_heads,
                                   int head_dim, float scale,
                                   int window_size, int q_offset);
+
+/*
+ * Fused final RMSNorm + logits matmul + argmax.
+ * Computes: x_norm = rms_norm(x, norm, eps), logits = x_norm @ tok_emb^T, argmax.
+ * Returns best token ID. logits_out may be NULL if not needed.
+ */
+int vox_metal_fused_logits_bf16(int dim, int vocab_size,
+                                  const float *x,
+                                  const float *norm_weight, float eps,
+                                  const uint16_t *tok_emb_bf16,
+                                  float *logits_out);
 
 /*
  * Pre-warm the bf16->f16 cache for a weight tensor.

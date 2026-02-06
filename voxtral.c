@@ -398,6 +398,7 @@ struct vox_stream {
     /* Timing */
     double encoder_ms;
     double decoder_ms;
+    double prefill_ms;
     int n_generated;
     int n_text_tokens;          /* tokens with ID >= 1000 (visible text) */
 };
@@ -839,8 +840,10 @@ static void stream_run_decoder(vox_stream_t *s) {
         s->decoder_started = 1;
 
         gettimeofday(&t1, NULL);
-        s->decoder_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 +
-                         (t1.tv_usec - t0.tv_usec) / 1000.0;
+        double pf_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                       (t1.tv_usec - t0.tv_usec) / 1000.0;
+        s->decoder_ms += pf_ms;
+        s->prefill_ms += pf_ms;
 
         if (vox_verbose >= 2)
             fprintf(stderr, "Decoder started (prefill %d, first token: %d)\n",
@@ -1012,9 +1015,14 @@ void vox_stream_free(vox_stream_t *s) {
     if (vox_verbose >= 1) {
         fprintf(stderr, "Encoder: %d mel -> %d tokens (%.0f ms)\n",
                 s->mel_cursor, s->total_adapter, s->encoder_ms);
-        if (s->n_text_tokens > 0)
-            fprintf(stderr, "Decoder: %d tokens in %.0f ms (%.1f ms/token)\n",
-                    s->n_text_tokens, s->decoder_ms, s->decoder_ms / s->n_text_tokens);
+        if (s->n_text_tokens > 0) {
+            double gen_ms = s->decoder_ms - s->prefill_ms;
+            fprintf(stderr, "Decoder: %d text tokens (%d steps) in %.0f ms "
+                    "(prefill %.0f ms + %.1f ms/step)\n",
+                    s->n_text_tokens, s->n_generated, s->decoder_ms,
+                    s->prefill_ms,
+                    s->n_generated > 1 ? gen_ms / (s->n_generated - 1) : 0);
+        }
     }
 
     vox_mel_free(s->mel_ctx);

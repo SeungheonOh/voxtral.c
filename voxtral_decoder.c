@@ -378,18 +378,18 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
     for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {
         vox_dec_layer_t *l = &dec->layers[layer];
 
-        vox_rms_norm(x_norm, x, l->attention_norm, 1, dim, VOX_DEC_NORM_EPS);
-
-        /* Q, K, V projections (bf16 weights) */
+        /* RMSNorm + Q, K, V projections */
 #ifdef USE_METAL
         if (vox_metal_available()) {
-            vox_metal_fused_qkv_bf16(1, dim, x_norm,
-                                      l->wq_weight_bf16, q_dim,
-                                      l->wk_weight_bf16, kv_dim,
-                                      l->wv_weight_bf16, kv_dim,
-                                      q, k, v);
+            vox_metal_fused_norm_qkv_bf16(1, dim, x,
+                                           l->attention_norm, VOX_DEC_NORM_EPS,
+                                           l->wq_weight_bf16, q_dim,
+                                           l->wk_weight_bf16, kv_dim,
+                                           l->wv_weight_bf16, kv_dim,
+                                           q, k, v);
         } else {
 #endif
+            vox_rms_norm(x_norm, x, l->attention_norm, 1, dim, VOX_DEC_NORM_EPS);
             vox_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, 1, dim, q_dim);
             vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, 1, dim, kv_dim);
             vox_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, 1, dim, kv_dim);
@@ -415,46 +415,55 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
                              1, total_seq, n_heads, n_kv_heads,
                              head_dim, scale, VOX_DEC_WINDOW, pos);
 
-        /* Output projection + residual */
-        vox_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, 1, q_dim, dim);
-        vox_add_inplace(x, proj_out, dim);
-
-        /* FFN */
-        vox_rms_norm(x_norm, x, l->ffn_norm, 1, dim, VOX_DEC_NORM_EPS);
-        if (ctx->ada_scale) {
-            const float *ada_s = ctx->ada_scale + (size_t)layer * dim;
-            for (int i = 0; i < dim; i++) x_norm[i] *= (1.0f + ada_s[i]);
-        }
-
+        /* Output projection + residual + FFN */
 #ifdef USE_METAL
         if (vox_metal_available()) {
-            vox_metal_fused_ffn_bf16(1, dim, hidden, x_norm,
-                                      l->w1_weight_bf16,
-                                      l->w3_weight_bf16,
-                                      l->w2_weight_bf16,
-                                      ffn_out);
+            const float *ada_s = ctx->ada_scale ?
+                ctx->ada_scale + (size_t)layer * dim : NULL;
+            vox_metal_fused_wo_ffn_bf16(1, dim, q_dim, hidden,
+                                         x, attn_out,
+                                         l->wo_weight_bf16,
+                                         l->ffn_norm, VOX_DEC_NORM_EPS,
+                                         ada_s,
+                                         l->w1_weight_bf16,
+                                         l->w3_weight_bf16,
+                                         l->w2_weight_bf16);
         } else {
 #endif
+            vox_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, 1, q_dim, dim);
+            vox_add_inplace(x, proj_out, dim);
+
+            vox_rms_norm(x_norm, x, l->ffn_norm, 1, dim, VOX_DEC_NORM_EPS);
+            if (ctx->ada_scale) {
+                const float *ada_s = ctx->ada_scale + (size_t)layer * dim;
+                for (int i = 0; i < dim; i++) x_norm[i] *= (1.0f + ada_s[i]);
+            }
+
             vox_linear_nobias_bf16(gate_buf, x_norm, l->w1_weight_bf16, 1, dim, hidden);
             vox_silu(gate_buf, hidden);
             vox_linear_nobias_bf16(up_buf, x_norm, l->w3_weight_bf16, 1, dim, hidden);
             vox_mul_inplace(gate_buf, up_buf, hidden);
             vox_linear_nobias_bf16(ffn_out, gate_buf, l->w2_weight_bf16, 1, hidden, dim);
+            vox_add_inplace(x, ffn_out, dim);
 #ifdef USE_METAL
         }
 #endif
-        vox_add_inplace(x, ffn_out, dim);
     }
 
     ctx->kv_cache_len = pos + 1;
 
-    /* Final norm */
+    /* Final norm + logits + argmax */
+#ifdef USE_METAL
+    if (vox_metal_available()) {
+        return vox_metal_fused_logits_bf16(dim, VOX_VOCAB_SIZE, x,
+                                            dec->norm, VOX_DEC_NORM_EPS,
+                                            dec->tok_embeddings_bf16,
+                                            logits);
+    }
+#endif
     vox_rms_norm(x, x, dec->norm, 1, dim, VOX_DEC_NORM_EPS);
-
-    /* Compute logits: x @ tok_embeddings^T (tied weights, bf16) */
     vox_matmul_t_bf16(logits, x, dec->tok_embeddings_bf16, 1, dim, VOX_VOCAB_SIZE);
 
-    /* Find argmax */
     int best = 0;
     float best_val = logits[0];
     for (int i = 1; i < VOX_VOCAB_SIZE; i++) {
@@ -463,6 +472,5 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
             best = i;
         }
     }
-
     return best;
 }
