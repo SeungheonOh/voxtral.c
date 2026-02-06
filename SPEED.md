@@ -16,7 +16,7 @@
 
 ## Current Baseline (2026-02-06)
 - Decoder: 23.7 ms/token (was 43.2 at start)
-- Prefill: ~335ms (was ~1200ms)
+- Prefill: ~252ms (was ~1200ms)
 - Encoder: ~298ms (test_speech.wav, 3.6s audio) (was ~2.7s at start)
 - Theoretical decoder floor: ~23 ms/token (300 GB/s bandwidth, 6.9 GB weights)
 - Remaining decoder overhead: 1 command buffer per token
@@ -142,14 +142,24 @@
 - **Result: encoder ~310 → ~298 ms (test_speech) — 4% faster**
 - jfk shows similar improvement (~690 → ~705ms, within noise)
 
+### Attempt 13: Merged decoder prefill weights (SUCCESS — BIG)
+- Same merged QKV + merged w1+w3 approach applied to decoder prefill path
+- Decoder prefill uses seq_len=38 through 26 layers, all in one command buffer
+- Merged QKV: [38, 3072] × [6144, 3072]^T instead of 3 separate matmuls
+- Merged w1+w3: [38, 3072] × [18432, 3072]^T instead of 2 separate matmuls
+- Reuses deinterleave + silu_mul_merged shaders from encoder
+- w2 reads from merged bufGate with strided rowBytes (hidden*2 = 18432)
+- No additional GPU memory (decoder merged weights already pre-warmed)
+- **Result: prefill ~335 → ~252 ms (25% faster)**
+
 ### Next targets
 - Decoder: ~23.7 ms/step, theoretical floor ~23 ms (0.7ms gap, near bandwidth limit)
 - Encoder: ~298ms for test_speech
   - MPS encoding overhead now only ~14ms (not the bottleneck)
   - GPU compute dominates: matmul + attention scaling with KV cache length
   - Attention is near memory bandwidth limit for large KV caches
-- Prefill: ~335ms, dominated by GPU compute (M=38 matmuls through 26 layers)
-  - MPS pipeline warmup on first command buffer still ~200ms
+- Prefill: ~252ms (improved from ~335ms)
+  - MPS pipeline warmup on first command buffer still causes ~30ms extra on first run
 
 ## MLX Credits
 - If any optimization ideas or kernel code are taken from Apple MLX
