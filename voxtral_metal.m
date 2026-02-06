@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <mach/mach_time.h>
 
 extern int vox_verbose;
 
@@ -1395,6 +1396,7 @@ void vox_metal_fused_wo_ffn_bf16(int M, int dim, int q_dim, int hidden,
             [enc setBuffer:bufXnorm offset:0 atIndex:0];
             [enc setBuffer:bufAda offset:0 atIndex:1];
             [enc setBytes:&n length:sizeof(int) atIndex:2];
+            [enc setBytes:&dim length:sizeof(int) atIndex:3];
             NSUInteger tgSize = MIN((NSUInteger)n, g_ada_scale_mul_pipeline.maxTotalThreadsPerThreadgroup);
             [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
@@ -1632,6 +1634,7 @@ static void encode_wo_ffn_steps(id<MTLCommandBuffer> cmdBuffer,
             [enc setBuffer:bufXnorm offset:0 atIndex:0];
             [enc setBuffer:bufAda offset:0 atIndex:1];
             [enc setBytes:&n length:sizeof(int) atIndex:2];
+            [enc setBytes:&dim length:sizeof(int) atIndex:3];
             tgSize = MIN((NSUInteger)n, g_ada_scale_mul_pipeline.maxTotalThreadsPerThreadgroup);
             [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
@@ -2638,6 +2641,8 @@ int vox_metal_encoder_full_step(void *ctx_ptr, float *x, int new_len,
 
         id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
 
+        uint64_t enc_t0 = mach_absolute_time();
+
         /* ---- 32 encoder layers ---- */
         for (int layer = 0; layer < VOX_ENC_LAYERS; layer++) {
             vox_enc_layer_t *l = &enc->layers[layer];
@@ -3095,8 +3100,19 @@ int vox_metal_encoder_full_step(void *ctx_ptr, float *x, int new_len,
             [enc_cmd endEncoding];
         }
 
+        uint64_t enc_t1 = mach_absolute_time();
         [cmdBuffer commit];
         [cmdBuffer waitUntilCompleted];
+        uint64_t enc_t2 = mach_absolute_time();
+
+        if (vox_verbose >= 2) {
+            mach_timebase_info_data_t info;
+            mach_timebase_info(&info);
+            double encode_ms = (double)(enc_t1 - enc_t0) * info.numer / info.denom / 1e6;
+            double commit_ms = (double)(enc_t2 - enc_t1) * info.numer / info.denom / 1e6;
+            fprintf(stderr, "[encoder] MPS encoding: %.1f ms, commit+wait: %.1f ms\n",
+                    encode_ms, commit_ms);
+        }
 
         /* Download result (from bufXnorm since final norm wrote there) */
         memcpy(x, [bufXnorm contents], (size_t)M * dim * sizeof(float));
@@ -3114,6 +3130,473 @@ int vox_metal_encoder_full_step(void *ctx_ptr, float *x, int new_len,
     }
 
     return 0;
+}
+
+/* ========================================================================
+ * Monolithic Decoder Prefill: all 26 layers in ONE command buffer (M>1)
+ * ======================================================================== */
+
+void vox_metal_decoder_prefill_step(void *ctx_ptr, float *x, int seq_len,
+                                      const float *rope_freqs) {
+    if (!g_initialized || !g_shaders_initialized) return;
+
+    vox_ctx_t *ctx = (vox_ctx_t *)ctx_ptr;
+    vox_decoder_t *dec = &ctx->decoder;
+
+    int dim = VOX_DEC_DIM;          /* 3072 */
+    int n_heads = VOX_DEC_HEADS;    /* 32 */
+    int n_kv_heads = VOX_DEC_KV_HEADS; /* 8 */
+    int head_dim = VOX_DEC_HEAD_DIM;/* 128 */
+    int hidden = VOX_DEC_HIDDEN;    /* 9216 */
+    int q_dim = n_heads * head_dim; /* 4096 */
+    int kv_dim = n_kv_heads * head_dim; /* 1024 */
+    int M = seq_len;
+    int start_pos = ctx->kv_cache_len;
+    int total_kv = start_pos + seq_len;
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    int window = VOX_DEC_WINDOW;
+
+    /* Find GPU buffer handles for decoder KV cache */
+    id<MTLBuffer> gpu_kv_k = find_shared_buffer(ctx->kv_cache_k);
+    id<MTLBuffer> gpu_kv_v = find_shared_buffer(ctx->kv_cache_v);
+    if (!gpu_kv_k || !gpu_kv_v) return;
+
+    @autoreleasepool {
+        /* Scratch buffers */
+        id<MTLBuffer> bufX = pool_get_buffer((size_t)M * dim * sizeof(float));
+        id<MTLBuffer> bufXnorm = pool_get_buffer((size_t)M * dim * sizeof(float));
+        id<MTLBuffer> bufQ = pool_get_buffer((size_t)M * q_dim * sizeof(float));
+        id<MTLBuffer> bufK = pool_get_buffer((size_t)M * kv_dim * sizeof(float));
+        id<MTLBuffer> bufV = pool_get_buffer((size_t)M * kv_dim * sizeof(float));
+        id<MTLBuffer> bufAttn = pool_get_buffer((size_t)M * q_dim * sizeof(float));
+        id<MTLBuffer> bufProj = pool_get_buffer((size_t)M * dim * sizeof(float));
+        id<MTLBuffer> bufGate = pool_get_buffer((size_t)M * hidden * sizeof(float));
+        id<MTLBuffer> bufUp = pool_get_buffer((size_t)M * hidden * sizeof(float));
+        id<MTLBuffer> bufFfnOut = pool_get_buffer((size_t)M * dim * sizeof(float));
+
+        /* Upload x and RoPE frequencies */
+        if (bufX) memcpy([bufX contents], x, (size_t)M * dim * sizeof(float));
+        size_t rope_size = (size_t)M * (head_dim / 2) * 2 * sizeof(float);
+        id<MTLBuffer> bufRope = pool_get_buffer(rope_size);
+        if (bufRope) memcpy([bufRope contents], rope_freqs, rope_size);
+
+        if (!bufX || !bufXnorm || !bufQ || !bufK || !bufV ||
+            !bufAttn || !bufProj || !bufGate || !bufUp || !bufFfnOut || !bufRope) {
+            pool_release_buffer(bufX);
+            pool_release_buffer(bufXnorm);
+            pool_release_buffer(bufQ);
+            pool_release_buffer(bufK);
+            pool_release_buffer(bufV);
+            pool_release_buffer(bufAttn);
+            pool_release_buffer(bufProj);
+            pool_release_buffer(bufGate);
+            pool_release_buffer(bufUp);
+            pool_release_buffer(bufFfnOut);
+            pool_release_buffer(bufRope);
+            return;
+        }
+
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+
+        /* ---- 26 decoder layers ---- */
+        for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {
+            vox_dec_layer_t *l = &dec->layers[layer];
+
+            /* Step 1: rms_norm(x, attention_norm) → x_norm */
+            {
+                id<MTLBuffer> bufNorm = get_cached_weight_buffer(l->attention_norm,
+                                                                   dim * sizeof(float));
+                float eps = VOX_DEC_NORM_EPS;
+                id<MTLComputeCommandEncoder> enc_cmd = [cmdBuffer computeCommandEncoder];
+                [enc_cmd setComputePipelineState:g_rms_norm_pipeline];
+                [enc_cmd setBuffer:bufX offset:0 atIndex:0];
+                [enc_cmd setBuffer:bufNorm offset:0 atIndex:1];
+                [enc_cmd setBuffer:bufXnorm offset:0 atIndex:2];
+                [enc_cmd setBytes:&dim length:sizeof(int) atIndex:3];
+                [enc_cmd setBytes:&eps length:sizeof(float) atIndex:4];
+                [enc_cmd dispatchThreadgroups:MTLSizeMake((NSUInteger)M, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc_cmd endEncoding];
+            }
+
+            /* Step 2: Q, K, V projections (no biases in decoder) */
+            {
+                id<MTLBuffer> bufWq = get_cached_bf16_as_f16_buffer(l->wq_weight_bf16,
+                                            (size_t)q_dim * dim);
+                id<MTLBuffer> bufWk = get_cached_bf16_as_f16_buffer(l->wk_weight_bf16,
+                                            (size_t)kv_dim * dim);
+                id<MTLBuffer> bufWv = get_cached_bf16_as_f16_buffer(l->wv_weight_bf16,
+                                            (size_t)kv_dim * dim);
+
+                MPSMatrixDescriptor *descIn = [MPSMatrixDescriptor
+                    matrixDescriptorWithRows:M columns:dim
+                                    rowBytes:dim * sizeof(float)
+                                    dataType:MPSDataTypeFloat32];
+                MPSMatrix *matIn = [[MPSMatrix alloc] initWithBuffer:bufXnorm descriptor:descIn];
+
+                /* Q */
+                {
+                    MPSMatrixDescriptor *descW = [MPSMatrixDescriptor
+                        matrixDescriptorWithRows:q_dim columns:dim
+                                        rowBytes:dim * sizeof(uint16_t)
+                                        dataType:MPSDataTypeFloat16];
+                    MPSMatrixDescriptor *descOut = [MPSMatrixDescriptor
+                        matrixDescriptorWithRows:M columns:q_dim
+                                        rowBytes:q_dim * sizeof(float)
+                                        dataType:MPSDataTypeFloat32];
+                    MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufWq descriptor:descW];
+                    MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:bufQ descriptor:descOut];
+                    MPSMatrixMultiplication *mm =
+                        get_cached_matmul_op(NO, YES, M, q_dim, dim, 1.0, 0.0);
+                    if (mm)
+                        [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matIn
+                                      rightMatrix:matW resultMatrix:matOut];
+                }
+
+                /* K */
+                {
+                    MPSMatrixDescriptor *descW = [MPSMatrixDescriptor
+                        matrixDescriptorWithRows:kv_dim columns:dim
+                                        rowBytes:dim * sizeof(uint16_t)
+                                        dataType:MPSDataTypeFloat16];
+                    MPSMatrixDescriptor *descOut = [MPSMatrixDescriptor
+                        matrixDescriptorWithRows:M columns:kv_dim
+                                        rowBytes:kv_dim * sizeof(float)
+                                        dataType:MPSDataTypeFloat32];
+                    MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufWk descriptor:descW];
+                    MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:bufK descriptor:descOut];
+                    MPSMatrixMultiplication *mm =
+                        get_cached_matmul_op(NO, YES, M, kv_dim, dim, 1.0, 0.0);
+                    if (mm)
+                        [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matIn
+                                      rightMatrix:matW resultMatrix:matOut];
+                }
+
+                /* V */
+                {
+                    MPSMatrixDescriptor *descW = [MPSMatrixDescriptor
+                        matrixDescriptorWithRows:kv_dim columns:dim
+                                        rowBytes:dim * sizeof(uint16_t)
+                                        dataType:MPSDataTypeFloat16];
+                    MPSMatrixDescriptor *descOut = [MPSMatrixDescriptor
+                        matrixDescriptorWithRows:M columns:kv_dim
+                                        rowBytes:kv_dim * sizeof(float)
+                                        dataType:MPSDataTypeFloat32];
+                    MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufWv descriptor:descW];
+                    MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:bufV descriptor:descOut];
+                    MPSMatrixMultiplication *mm2 =
+                        get_cached_matmul_op(NO, YES, M, kv_dim, dim, 1.0, 0.0);
+                    if (mm2)
+                        [mm2 encodeToCommandBuffer:cmdBuffer leftMatrix:matIn
+                                       rightMatrix:matW resultMatrix:matOut];
+                }
+            }
+
+            /* Step 3: RoPE + KV cache write + attention */
+            {
+                id<MTLComputeCommandEncoder> enc_cmd = [cmdBuffer computeCommandEncoder];
+
+                /* Batched RoPE on Q */
+                [enc_cmd setComputePipelineState:g_batched_rope_apply_pipeline];
+                [enc_cmd setBuffer:bufQ offset:0 atIndex:0];
+                [enc_cmd setBuffer:bufRope offset:0 atIndex:1];
+                [enc_cmd setBytes:&n_heads length:sizeof(int) atIndex:2];
+                [enc_cmd setBytes:&head_dim length:sizeof(int) atIndex:3];
+                [enc_cmd setBytes:&M length:sizeof(int) atIndex:4];
+                {
+                    int n_threads = M * n_heads * (head_dim / 2);
+                    NSUInteger tg = MIN((NSUInteger)n_threads,
+                                        g_batched_rope_apply_pipeline.maxTotalThreadsPerThreadgroup);
+                    [enc_cmd dispatchThreads:MTLSizeMake((NSUInteger)n_threads, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                }
+
+                /* Batched RoPE on K */
+                [enc_cmd setBuffer:bufK offset:0 atIndex:0];
+                [enc_cmd setBytes:&n_kv_heads length:sizeof(int) atIndex:2];
+                {
+                    int n_threads = M * n_kv_heads * (head_dim / 2);
+                    NSUInteger tg = MIN((NSUInteger)n_threads,
+                                        g_batched_rope_apply_pipeline.maxTotalThreadsPerThreadgroup);
+                    [enc_cmd dispatchThreads:MTLSizeMake((NSUInteger)n_threads, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                }
+
+                [enc_cmd memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+                /* Copy K to KV cache */
+                int kv_offset = (int)((size_t)layer * ctx->kv_cache_max + start_pos) * kv_dim;
+                int kv_total = M * kv_dim;
+                [enc_cmd setComputePipelineState:g_batched_kv_cache_copy_pipeline];
+                [enc_cmd setBuffer:gpu_kv_k offset:0 atIndex:0];
+                [enc_cmd setBuffer:bufK offset:0 atIndex:1];
+                [enc_cmd setBytes:&kv_offset length:sizeof(int) atIndex:2];
+                [enc_cmd setBytes:&kv_total length:sizeof(int) atIndex:3];
+                {
+                    NSUInteger tg = MIN((NSUInteger)kv_total,
+                                        g_batched_kv_cache_copy_pipeline.maxTotalThreadsPerThreadgroup);
+                    [enc_cmd dispatchThreads:MTLSizeMake((NSUInteger)kv_total, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                }
+
+                /* Copy V to KV cache */
+                [enc_cmd setBuffer:gpu_kv_v offset:0 atIndex:0];
+                [enc_cmd setBuffer:bufV offset:0 atIndex:1];
+                [enc_cmd setBytes:&kv_offset length:sizeof(int) atIndex:2];
+                [enc_cmd dispatchThreads:MTLSizeMake((NSUInteger)kv_total, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(
+                        MIN((NSUInteger)kv_total,
+                            g_batched_kv_cache_copy_pipeline.maxTotalThreadsPerThreadgroup), 1, 1)];
+
+                [enc_cmd memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+                /* Batched attention (using encoder_attention kernel with head_dim=128) */
+                int q_offset_val = ctx->kv_pos_offset + start_pos;
+                size_t layer_kv_offset = (size_t)layer * ctx->kv_cache_max * kv_dim * sizeof(float);
+                [enc_cmd setComputePipelineState:g_encoder_attention_pipeline];
+                [enc_cmd setBuffer:bufQ offset:0 atIndex:0];
+                [enc_cmd setBuffer:gpu_kv_k offset:layer_kv_offset atIndex:1];
+                [enc_cmd setBuffer:gpu_kv_v offset:layer_kv_offset atIndex:2];
+                [enc_cmd setBuffer:bufAttn offset:0 atIndex:3];
+                [enc_cmd setBytes:&n_heads length:sizeof(int) atIndex:4];
+                [enc_cmd setBytes:&n_kv_heads length:sizeof(int) atIndex:5];
+                [enc_cmd setBytes:&head_dim length:sizeof(int) atIndex:6];
+                [enc_cmd setBytes:&M length:sizeof(int) atIndex:7];
+                [enc_cmd setBytes:&total_kv length:sizeof(int) atIndex:8];
+                [enc_cmd setBytes:&attn_scale length:sizeof(float) atIndex:9];
+                [enc_cmd setBytes:&window length:sizeof(int) atIndex:10];
+                [enc_cmd setBytes:&q_offset_val length:sizeof(int) atIndex:11];
+                {
+                    /* head_dim threads per group, 1 group per (head, query_pos) */
+                    int n_groups = n_heads * M;
+                    [enc_cmd dispatchThreadgroups:MTLSizeMake((NSUInteger)n_groups, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake((NSUInteger)head_dim, 1, 1)];
+                }
+
+                [enc_cmd endEncoding];
+            }
+
+            /* Step 4: wo projection */
+            {
+                id<MTLBuffer> bufWo = get_cached_bf16_as_f16_buffer(l->wo_weight_bf16,
+                                            (size_t)dim * q_dim);
+                MPSMatrixDescriptor *descA = [MPSMatrixDescriptor
+                    matrixDescriptorWithRows:M columns:q_dim
+                                    rowBytes:q_dim * sizeof(float)
+                                    dataType:MPSDataTypeFloat32];
+                MPSMatrixDescriptor *descW = [MPSMatrixDescriptor
+                    matrixDescriptorWithRows:dim columns:q_dim
+                                    rowBytes:q_dim * sizeof(uint16_t)
+                                    dataType:MPSDataTypeFloat16];
+                MPSMatrixDescriptor *descOut = [MPSMatrixDescriptor
+                    matrixDescriptorWithRows:M columns:dim
+                                    rowBytes:dim * sizeof(float)
+                                    dataType:MPSDataTypeFloat32];
+                MPSMatrix *matA = [[MPSMatrix alloc] initWithBuffer:bufAttn descriptor:descA];
+                MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufWo descriptor:descW];
+                MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:bufProj descriptor:descOut];
+                MPSMatrixMultiplication *mm =
+                    get_cached_matmul_op(NO, YES, M, dim, q_dim, 1.0, 0.0);
+                if (mm)
+                    [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matA
+                                  rightMatrix:matW resultMatrix:matOut];
+            }
+
+            /* Step 5: residual + FFN norm + ada_scale */
+            {
+                id<MTLBuffer> bufFfnNorm = get_cached_weight_buffer(l->ffn_norm,
+                                                dim * sizeof(float));
+                id<MTLBuffer> bufAda = ctx->ada_scale ?
+                    get_cached_weight_buffer(ctx->ada_scale + (size_t)layer * dim,
+                                               dim * sizeof(float)) : nil;
+                int n = M * dim;
+                float eps = VOX_DEC_NORM_EPS;
+
+                id<MTLComputeCommandEncoder> enc_cmd = [cmdBuffer computeCommandEncoder];
+
+                /* x += proj_out */
+                [enc_cmd setComputePipelineState:g_add_inplace_pipeline];
+                [enc_cmd setBuffer:bufX offset:0 atIndex:0];
+                [enc_cmd setBuffer:bufProj offset:0 atIndex:1];
+                [enc_cmd setBytes:&n length:sizeof(int) atIndex:2];
+                {
+                    NSUInteger tg = MIN((NSUInteger)n,
+                                        g_add_inplace_pipeline.maxTotalThreadsPerThreadgroup);
+                    [enc_cmd dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                }
+
+                [enc_cmd memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+                /* x_norm = rms_norm(x, ffn_norm) */
+                [enc_cmd setComputePipelineState:g_rms_norm_pipeline];
+                [enc_cmd setBuffer:bufX offset:0 atIndex:0];
+                [enc_cmd setBuffer:bufFfnNorm offset:0 atIndex:1];
+                [enc_cmd setBuffer:bufXnorm offset:0 atIndex:2];
+                [enc_cmd setBytes:&dim length:sizeof(int) atIndex:3];
+                [enc_cmd setBytes:&eps length:sizeof(float) atIndex:4];
+                [enc_cmd dispatchThreadgroups:MTLSizeMake((NSUInteger)M, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+                /* x_norm *= (1 + ada_scale) if present */
+                if (bufAda) {
+                    [enc_cmd memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    [enc_cmd setComputePipelineState:g_ada_scale_mul_pipeline];
+                    [enc_cmd setBuffer:bufXnorm offset:0 atIndex:0];
+                    [enc_cmd setBuffer:bufAda offset:0 atIndex:1];
+                    [enc_cmd setBytes:&n length:sizeof(int) atIndex:2];
+                    [enc_cmd setBytes:&dim length:sizeof(int) atIndex:3];
+                    {
+                        NSUInteger tg = MIN((NSUInteger)n,
+                                            g_ada_scale_mul_pipeline.maxTotalThreadsPerThreadgroup);
+                        [enc_cmd dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                    }
+                }
+
+                [enc_cmd endEncoding];
+            }
+
+            /* Step 6: FFN with separate w1, w3 matmuls */
+            {
+                id<MTLBuffer> bufW1 = get_cached_bf16_as_f16_buffer(l->w1_weight_bf16,
+                                            (size_t)hidden * dim);
+                id<MTLBuffer> bufW3 = get_cached_bf16_as_f16_buffer(l->w3_weight_bf16,
+                                            (size_t)hidden * dim);
+                id<MTLBuffer> bufW2 = get_cached_bf16_as_f16_buffer(l->w2_weight_bf16,
+                                            (size_t)dim * hidden);
+
+                MPSMatrixDescriptor *descIn = [MPSMatrixDescriptor
+                    matrixDescriptorWithRows:M columns:dim
+                                    rowBytes:dim * sizeof(float)
+                                    dataType:MPSDataTypeFloat32];
+                MPSMatrixDescriptor *descWh = [MPSMatrixDescriptor
+                    matrixDescriptorWithRows:hidden columns:dim
+                                    rowBytes:dim * sizeof(uint16_t)
+                                    dataType:MPSDataTypeFloat16];
+                MPSMatrixDescriptor *descH = [MPSMatrixDescriptor
+                    matrixDescriptorWithRows:M columns:hidden
+                                    rowBytes:hidden * sizeof(float)
+                                    dataType:MPSDataTypeFloat32];
+                MPSMatrix *matIn = [[MPSMatrix alloc] initWithBuffer:bufXnorm descriptor:descIn];
+
+                /* gate = x_norm @ w1^T */
+                {
+                    MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufW1 descriptor:descWh];
+                    MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:bufGate descriptor:descH];
+                    MPSMatrixMultiplication *mm =
+                        get_cached_matmul_op(NO, YES, M, hidden, dim, 1.0, 0.0);
+                    if (mm)
+                        [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matIn
+                                      rightMatrix:matW resultMatrix:matOut];
+                }
+
+                /* up = x_norm @ w3^T */
+                {
+                    MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufW3 descriptor:descWh];
+                    MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:bufUp descriptor:descH];
+                    MPSMatrixMultiplication *mm =
+                        get_cached_matmul_op(NO, YES, M, hidden, dim, 1.0, 0.0);
+                    if (mm)
+                        [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matIn
+                                      rightMatrix:matW resultMatrix:matOut];
+                }
+
+                /* silu(gate), gate *= up */
+                {
+                    int n_gate = M * hidden;
+                    id<MTLComputeCommandEncoder> enc_cmd = [cmdBuffer computeCommandEncoder];
+
+                    [enc_cmd setComputePipelineState:g_silu_pipeline];
+                    [enc_cmd setBuffer:bufGate offset:0 atIndex:0];
+                    [enc_cmd setBytes:&n_gate length:sizeof(int) atIndex:1];
+                    {
+                        NSUInteger tg = MIN((NSUInteger)n_gate,
+                                            g_silu_pipeline.maxTotalThreadsPerThreadgroup);
+                        [enc_cmd dispatchThreads:MTLSizeMake((NSUInteger)n_gate, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                    }
+
+                    [enc_cmd memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+                    [enc_cmd setComputePipelineState:g_mul_inplace_pipeline];
+                    [enc_cmd setBuffer:bufGate offset:0 atIndex:0];
+                    [enc_cmd setBuffer:bufUp offset:0 atIndex:1];
+                    [enc_cmd setBytes:&n_gate length:sizeof(int) atIndex:2];
+                    {
+                        NSUInteger tg = MIN((NSUInteger)n_gate,
+                                            g_mul_inplace_pipeline.maxTotalThreadsPerThreadgroup);
+                        [enc_cmd dispatchThreads:MTLSizeMake((NSUInteger)n_gate, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                    }
+
+                    [enc_cmd endEncoding];
+                }
+
+                /* ffn_out = gate @ w2^T */
+                {
+                    MPSMatrixDescriptor *descG = [MPSMatrixDescriptor
+                        matrixDescriptorWithRows:M columns:hidden
+                                        rowBytes:hidden * sizeof(float)
+                                        dataType:MPSDataTypeFloat32];
+                    MPSMatrixDescriptor *descW2 = [MPSMatrixDescriptor
+                        matrixDescriptorWithRows:dim columns:hidden
+                                        rowBytes:hidden * sizeof(uint16_t)
+                                        dataType:MPSDataTypeFloat16];
+                    MPSMatrixDescriptor *descOut = [MPSMatrixDescriptor
+                        matrixDescriptorWithRows:M columns:dim
+                                        rowBytes:dim * sizeof(float)
+                                        dataType:MPSDataTypeFloat32];
+                    MPSMatrix *matG = [[MPSMatrix alloc] initWithBuffer:bufGate descriptor:descG];
+                    MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufW2 descriptor:descW2];
+                    MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:bufFfnOut descriptor:descOut];
+                    MPSMatrixMultiplication *mm =
+                        get_cached_matmul_op(NO, YES, M, dim, hidden, 1.0, 0.0);
+                    if (mm)
+                        [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matG
+                                      rightMatrix:matW resultMatrix:matOut];
+                }
+
+                /* x += ffn_out */
+                {
+                    int n = M * dim;
+                    id<MTLComputeCommandEncoder> enc_cmd = [cmdBuffer computeCommandEncoder];
+                    [enc_cmd setComputePipelineState:g_add_inplace_pipeline];
+                    [enc_cmd setBuffer:bufX offset:0 atIndex:0];
+                    [enc_cmd setBuffer:bufFfnOut offset:0 atIndex:1];
+                    [enc_cmd setBytes:&n length:sizeof(int) atIndex:2];
+                    {
+                        NSUInteger tg = MIN((NSUInteger)n,
+                                            g_add_inplace_pipeline.maxTotalThreadsPerThreadgroup);
+                        [enc_cmd dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                    }
+                    [enc_cmd endEncoding];
+                }
+            }
+        } /* end 26 layers */
+
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+
+        /* Download result */
+        memcpy(x, [bufX contents], (size_t)M * dim * sizeof(float));
+
+        pool_release_buffer(bufX);
+        pool_release_buffer(bufXnorm);
+        pool_release_buffer(bufQ);
+        pool_release_buffer(bufK);
+        pool_release_buffer(bufV);
+        pool_release_buffer(bufAttn);
+        pool_release_buffer(bufProj);
+        pool_release_buffer(bufGate);
+        pool_release_buffer(bufUp);
+        pool_release_buffer(bufFfnOut);
+        pool_release_buffer(bufRope);
+    }
+
+    /* Update KV cache length */
+    ctx->kv_cache_len = start_pos + seq_len;
 }
 
 /* ========================================================================

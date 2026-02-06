@@ -9,7 +9,7 @@
 
 ## Current Baseline (2026-02-06)
 - Decoder: 23.7 ms/token (was 43.2 at start)
-- Prefill: ~380ms (was ~1200ms)
+- Prefill: ~335ms (was ~1200ms)
 - Encoder: ~310ms (test_speech.wav, 3.6s audio) (was ~2.7s at start)
 - Theoretical decoder floor: ~23 ms/token (300 GB/s bandwidth, 6.9 GB weights)
 - Remaining decoder overhead: 1 command buffer per token
@@ -107,11 +107,6 @@
 - Fused QKV and FFN for decoder prefill (3 cmd bufs/layer instead of 7)
 - **Result: prefill 1212 → 500 ms (test_speech), 1166 → 499 ms (jfk) — 57% faster**
 
-### Failed: GPU decoder prefill
-- Moved prefill matmuls from individual sgemm to fused_qkv + batched_attention + fused_ffn
-- No improvement over individual sgemm path — GPU compute dominates for M=97, cmd buf overhead minimal
-- The big win was pre-warming (moved 700ms of lazy init to model loading), not fusion
-
 ### Attempt 10: Monolithic encoder step (SUCCESS)
 - All 32 encoder layers + final norm in ONE Metal command buffer
 - 3 new Metal compute shaders: bias_add, batched_rope_apply, batched_kv_cache_copy
@@ -121,13 +116,20 @@
 - **Result: encoder 456 → 310 ms (test_speech), 1082 → 690 ms (jfk) — 32-36% faster**
 - **Cumulative encoder: 2.7s → 310 ms (89% faster)**
 
+### Attempt 11: Monolithic decoder prefill (SUCCESS)
+- All 26 decoder layers in ONE Metal command buffer for prefill (M>1)
+- Reuses encoder_attention shader (already supports head_dim=128 via dynamic SIMD groups)
+- Moved attention + wo projection from CPU to GPU (they were last remaining CPU ops in prefill)
+- Fixed ada_scale_mul shader: added stride parameter for M>1 (was reading out-of-bounds)
+- **Result: prefill 380 → 338 ms (test_speech), 380 → 327 ms (jfk) — 11-14% faster**
+
 ### Next targets
 - Decoder: ~23.7 ms/step, theoretical floor ~23 ms (0.7ms gap, near bandwidth limit)
 - Encoder: ~310ms for test_speech
   - MPS matmul encoding overhead: ~576 encodes per step × ~0.15ms each
   - Ideas: merged QKV weights (3→1 encode per layer), merged w1+w3 (needs strided silu)
-- Prefill: ~380ms, dominated by GPU compute (M=97 matmuls through 26 layers)
-  - ~200ms of first-token overhead remains (MPS pipeline warmup on first cmd buffer)
+- Prefill: ~335ms, dominated by GPU compute (M=38 matmuls through 26 layers)
+  - MPS pipeline warmup on first command buffer still ~200ms
 
 ## MLX Credits
 - If any optimization ideas or kernel code are taken from Apple MLX

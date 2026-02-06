@@ -267,6 +267,17 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
     float *rope_freqs = (float *)malloc(seq_len * (head_dim / 2) * 2 * sizeof(float));
     vox_compute_rope_freqs(rope_freqs, positions, seq_len, head_dim, VOX_ROPE_THETA);
 
+    /* GPU monolithic prefill: all 26 layers in one command buffer */
+#ifdef USE_METAL
+    if (vox_metal_available()) {
+        vox_metal_decoder_prefill_step(ctx, x, seq_len, rope_freqs);
+        free(x); free(x_norm); free(q); free(k); free(v);
+        free(attn_out); free(proj_out); free(ffn_out);
+        free(positions); free(rope_freqs);
+        return;
+    }
+#endif
+
     for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {
         vox_dec_layer_t *l = &dec->layers[layer];
 

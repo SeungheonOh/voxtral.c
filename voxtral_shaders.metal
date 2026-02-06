@@ -109,9 +109,10 @@ kernel void ada_scale_mul(
     device float *x [[buffer(0)]],
     device const float *scale [[buffer(1)]],
     constant int &n [[buffer(2)]],
+    constant int &stride [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    if (gid < uint(n)) x[gid] *= (1.0f + scale[gid]);
+    if (gid < uint(n)) x[gid] *= (1.0f + scale[gid % stride]);
 }
 
 /* ========================================================================
@@ -355,10 +356,11 @@ kernel void decoder_attention(
 }
 
 /* ========================================================================
- * Batched encoder attention: one threadgroup per (head, query_position).
- * Replaces 64 per-head MPS matmul encodes with a single compute dispatch.
+ * Batched attention: one threadgroup per (head, query_position).
+ * Supports head_dim=64 (64 threads, 2 SIMD groups) and head_dim=128
+ * (128 threads, 4 SIMD groups). Used for both encoder and decoder prefill.
  * Q/K/V layout: [seq, n_heads * head_dim] packed (head-interleaved).
- * Uses online softmax, 64 threads per group (head_dim=64, 2 SIMD groups).
+ * Uses online softmax, cooperative SIMD dot products.
  * ======================================================================== */
 
 kernel void encoder_attention(
@@ -377,7 +379,8 @@ kernel void encoder_attention(
     uint group_idx [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint tg_size [[threads_per_threadgroup]]
 ) {
     /* 1D grid: group_idx = h * seq_q + qi */
     int h = (int)group_idx / seq_q;
@@ -396,8 +399,9 @@ kernel void encoder_attention(
     int valid_end = min(q_pos, seq_k - 1);
     int valid_start = (window_size > 0) ? max(0, q_pos - window_size + 1) : 0;
 
-    /* 64 threads = 2 SIMD groups of 32 */
-    threadgroup float shared_simd[2];
+    /* Up to 4 SIMD groups (supports head_dim 64 and 128) */
+    threadgroup float shared_simd[4];
+    int n_simd_groups = (int)tg_size / 32;
 
     float q_val = (int)tid < head_dim ? q_row[tid] : 0.0f;
 
@@ -413,11 +417,13 @@ kernel void encoder_attention(
         float partial = (int)tid < head_dim ? q_val * k_j[tid] : 0.0f;
         float simd_partial = simd_sum(partial);
 
-        /* Cross-SIMD reduction: 2 groups → 1 value */
+        /* Cross-SIMD reduction */
         if (simd_lid == 0) shared_simd[simd_gid] = simd_partial;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid == 0) {
-            shared_simd[0] = (shared_simd[0] + shared_simd[1]) * scale;
+            float sum = shared_simd[0];
+            for (int g = 1; g < n_simd_groups; g++) sum += shared_simd[g];
+            shared_simd[0] = sum * scale;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         float score = shared_simd[0];

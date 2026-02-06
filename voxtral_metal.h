@@ -245,6 +245,15 @@ void vox_metal_warmup_merged_3(const uint16_t *a, size_t a_n,
 int vox_metal_encoder_full_step(void *ctx, float *x, int new_len,
                                  const float *rope_freqs, int cache_len);
 
+/*
+ * Monolithic decoder prefill: all 26 layers in ONE command buffer (M>1).
+ * x is [seq_len, VOX_DEC_DIM] float, modified in-place.
+ * rope_freqs: [seq_len, head_dim/2, 2] precomputed frequencies.
+ * Updates ctx->kv_cache_len internally.
+ */
+void vox_metal_decoder_prefill_step(void *ctx, float *x, int seq_len,
+                                      const float *rope_freqs);
+
 /* GPU memory usage (for debugging). */
 size_t vox_metal_memory_used(void);
 
