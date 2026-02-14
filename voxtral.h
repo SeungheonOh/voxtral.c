@@ -163,6 +163,9 @@ typedef struct {
     /* KV cache for decoder (rolling: compacted when full) */
     float *kv_cache_k;       /* [layers, max_seq, kv_heads * head_dim] */
     float *kv_cache_v;       /* [layers, max_seq, kv_heads * head_dim] */
+    uint16_t *kv_cache_k_f16;/* Optional fp16 KV cache (Metal path) */
+    uint16_t *kv_cache_v_f16;/* Optional fp16 KV cache (Metal path) */
+    int kv_cache_fp16;       /* 1 if decoder KV cache uses fp16 storage */
     int kv_cache_len;        /* Current physical cache length */
     int kv_cache_max;        /* Maximum cache size */
     int kv_pos_offset;       /* Logical position offset (positions discarded by compaction) */

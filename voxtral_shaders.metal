@@ -269,12 +269,24 @@ kernel void kv_cache_copy(
     }
 }
 
+kernel void kv_cache_copy_f16(
+    device half *cache [[buffer(0)]],
+    device const float *data [[buffer(1)]],
+    constant int &elem_offset [[buffer(2)]],
+    constant int &kv_dim [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if ((int)gid < kv_dim) {
+        cache[elem_offset + gid] = half(data[gid]);
+    }
+}
+
 /* ========================================================================
  * Single-token decoder attention (seq_q=1).
- * One threadgroup per query head, 128 threads cooperate on dot products.
+ * One threadgroup per query head, 32 threads (one SIMD group).
+ * Each lane handles 4 dims (head_dim=128), avoiding cross-SIMD barriers.
  * K/V read from the KV cache buffer at a per-layer offset.
- * Uses online softmax (single pass) with SIMD group reductions.
- * 128 threads = 4 SIMD groups of 32. simd_sum for fast dot product.
+ * Uses online softmax (single pass) with SIMD reductions.
  * ======================================================================== */
 
 kernel void decoder_attention(
@@ -291,9 +303,7 @@ kernel void decoder_attention(
     constant int &window_size [[buffer(10)]],
     constant int &q_pos [[buffer(11)]],
     uint head_idx [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]
+    uint tid [[thread_position_in_threadgroup]]
 ) {
     if ((int)head_idx >= n_heads) return;
 
@@ -306,53 +316,131 @@ kernel void decoder_attention(
     int valid_end = min(q_pos, seq_k - 1);
     int valid_start = (window_size > 0) ? max(0, q_pos - window_size + 1) : 0;
 
-    /* 128 threads = 4 SIMD groups of 32 */
-    threadgroup float shared_simd[4];
+    /* Decoder uses head_dim=128. One lane computes 4 dimensions. */
+    int d0 = (int)tid;
+    int d1 = d0 + 32;
+    int d2 = d1 + 32;
+    int d3 = d2 + 32;
 
-    /* Each thread loads one Q element (head_dim=128) */
-    float q_val = (int)tid < head_dim ? q_h[tid] : 0.0f;
+    float q0 = (d0 < head_dim) ? q_h[d0] : 0.0f;
+    float q1 = (d1 < head_dim) ? q_h[d1] : 0.0f;
+    float q2 = (d2 < head_dim) ? q_h[d2] : 0.0f;
+    float q3 = (d3 < head_dim) ? q_h[d3] : 0.0f;
 
     /* Online softmax: single pass over keys */
     float running_max = -INFINITY;
     float running_sum = 0.0f;
-    float acc = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
 
     for (int j = valid_start; j <= valid_end; j++) {
         device const float *k_j = K_cache + j * kv_dim + kv_head * head_dim;
 
-        /* Cooperative dot product using SIMD reductions */
-        float partial = (int)tid < head_dim ? q_val * k_j[tid] : 0.0f;
-        float simd_partial = simd_sum(partial);
-
-        /* Cross-SIMD reduction: 4 groups → 1 value */
-        if (simd_lid == 0) shared_simd[simd_gid] = simd_partial;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float score;
-        if (tid == 0) {
-            shared_simd[0] = (shared_simd[0] + shared_simd[1] +
-                              shared_simd[2] + shared_simd[3]) * scale;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        score = shared_simd[0];
+        /* One SIMD-group dot product (32 lanes x 4 dims/lane). */
+        float partial = q0 * k_j[d0] + q1 * k_j[d1] + q2 * k_j[d2] + q3 * k_j[d3];
+        float score = simd_sum(partial) * scale;
 
         /* Online softmax update */
         float old_max = running_max;
         running_max = fmax(running_max, score);
         float correction = exp(old_max - running_max);
-        running_sum = running_sum * correction + exp(score - running_max);
-        acc = acc * correction;
+        float weight = exp(score - running_max);
+        running_sum = running_sum * correction + weight;
+        acc0 *= correction;
+        acc1 *= correction;
+        acc2 *= correction;
+        acc3 *= correction;
 
         /* Accumulate weighted V */
-        if ((int)tid < head_dim) {
-            device const float *v_j = V_cache + j * kv_dim + kv_head * head_dim;
-            acc += exp(score - running_max) * v_j[tid];
-        }
+        device const float *v_j = V_cache + j * kv_dim + kv_head * head_dim;
+        acc0 += weight * v_j[d0];
+        acc1 += weight * v_j[d1];
+        acc2 += weight * v_j[d2];
+        acc3 += weight * v_j[d3];
     }
 
     /* Normalize and write output */
-    if ((int)tid < head_dim) {
-        out_h[tid] = acc / (running_sum + 1e-10f);
+    float inv = 1.0f / (running_sum + 1e-10f);
+    out_h[d0] = acc0 * inv;
+    out_h[d1] = acc1 * inv;
+    out_h[d2] = acc2 * inv;
+    out_h[d3] = acc3 * inv;
+}
+
+kernel void decoder_attention_f16(
+    device const float *Q [[buffer(0)]],
+    device const half *K_cache [[buffer(1)]],
+    device const half *V_cache [[buffer(2)]],
+    device float *out [[buffer(3)]],
+    constant int &n_heads [[buffer(4)]],
+    constant int &n_kv_heads [[buffer(5)]],
+    constant int &head_dim [[buffer(6)]],
+    constant int &kv_dim [[buffer(7)]],
+    constant int &seq_k [[buffer(8)]],
+    constant float &scale [[buffer(9)]],
+    constant int &window_size [[buffer(10)]],
+    constant int &q_pos [[buffer(11)]],
+    uint head_idx [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if ((int)head_idx >= n_heads) return;
+
+    int gqa_ratio = n_heads / n_kv_heads;
+    int kv_head = (int)head_idx / gqa_ratio;
+
+    device const float *q_h = Q + head_idx * head_dim;
+    device float *out_h = out + head_idx * head_dim;
+
+    int valid_end = min(q_pos, seq_k - 1);
+    int valid_start = (window_size > 0) ? max(0, q_pos - window_size + 1) : 0;
+
+    int d0 = (int)tid;
+    int d1 = d0 + 32;
+    int d2 = d1 + 32;
+    int d3 = d2 + 32;
+
+    float q0 = (d0 < head_dim) ? q_h[d0] : 0.0f;
+    float q1 = (d1 < head_dim) ? q_h[d1] : 0.0f;
+    float q2 = (d2 < head_dim) ? q_h[d2] : 0.0f;
+    float q3 = (d3 < head_dim) ? q_h[d3] : 0.0f;
+
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+
+    for (int j = valid_start; j <= valid_end; j++) {
+        device const half *k_j = K_cache + j * kv_dim + kv_head * head_dim;
+        float partial = q0 * float(k_j[d0]) + q1 * float(k_j[d1]) +
+                        q2 * float(k_j[d2]) + q3 * float(k_j[d3]);
+        float score = simd_sum(partial) * scale;
+
+        float old_max = running_max;
+        running_max = fmax(running_max, score);
+        float correction = exp(old_max - running_max);
+        float weight = exp(score - running_max);
+        running_sum = running_sum * correction + weight;
+        acc0 *= correction;
+        acc1 *= correction;
+        acc2 *= correction;
+        acc3 *= correction;
+
+        device const half *v_j = V_cache + j * kv_dim + kv_head * head_dim;
+        acc0 += weight * float(v_j[d0]);
+        acc1 += weight * float(v_j[d1]);
+        acc2 += weight * float(v_j[d2]);
+        acc3 += weight * float(v_j[d3]);
     }
+
+    float inv = 1.0f / (running_sum + 1e-10f);
+    out_h[d0] = acc0 * inv;
+    out_h[d1] = acc1 * inv;
+    out_h[d2] = acc2 * inv;
+    out_h[d3] = acc3 * inv;
 }
 
 /* ========================================================================
@@ -480,6 +568,316 @@ kernel void encoder_attention(
     }
 }
 
+kernel void encoder_attention_kv_f16(
+    device const float *Q [[buffer(0)]],
+    device const half *K [[buffer(1)]],
+    device const half *V [[buffer(2)]],
+    device float *out [[buffer(3)]],
+    constant int &n_heads [[buffer(4)]],
+    constant int &n_kv_heads [[buffer(5)]],
+    constant int &head_dim [[buffer(6)]],
+    constant int &seq_q [[buffer(7)]],
+    constant int &seq_k [[buffer(8)]],
+    constant float &scale [[buffer(9)]],
+    constant int &window_size [[buffer(10)]],
+    constant int &q_offset [[buffer(11)]],
+    uint group_idx [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    int n_q_blocks = (seq_q + ATTN_BQ - 1) / ATTN_BQ;
+    int h = (int)group_idx / n_q_blocks;
+    int qb = (int)group_idx % n_q_blocks;
+    int qi_start = qb * ATTN_BQ;
+    if (h >= n_heads) return;
+
+    int gqa_ratio = n_heads / n_kv_heads;
+    int kv_h = h / gqa_ratio;
+    int stride_q = n_heads * head_dim;
+    int stride_kv = n_kv_heads * head_dim;
+    int n_simd_groups = (int)tg_size / 32;
+
+    float q_vals[ATTN_BQ];
+    for (int b = 0; b < ATTN_BQ; b++) {
+        int qi = qi_start + b;
+        q_vals[b] = (qi < seq_q && (int)tid < head_dim)
+            ? Q[(long)qi * stride_q + h * head_dim + tid] : 0.0f;
+    }
+
+    float rmax[ATTN_BQ], rsum[ATTN_BQ], acc[ATTN_BQ];
+    for (int b = 0; b < ATTN_BQ; b++) {
+        rmax[b] = -INFINITY;
+        rsum[b] = 0.0f;
+        acc[b] = 0.0f;
+    }
+
+    threadgroup float tg_simd[4 * ATTN_BQ];
+    threadgroup float tg_scores[ATTN_BQ];
+
+    int last_qi = min(qi_start + ATTN_BQ - 1, seq_q - 1);
+    int first_pos = q_offset + qi_start;
+    int last_pos = q_offset + last_qi;
+    int loop_start = (window_size > 0) ? max(0, first_pos - window_size + 1) : 0;
+    int loop_end = min(last_pos, seq_k - 1);
+
+    for (int j = loop_start; j <= loop_end; j++) {
+        device const half *k_j = K + (long)j * stride_kv + kv_h * head_dim;
+        float k_val = (int)tid < head_dim ? float(k_j[tid]) : 0.0f;
+
+        for (int b = 0; b < ATTN_BQ; b++) {
+            float simd_dot = simd_sum(q_vals[b] * k_val);
+            if (simd_lid == 0) tg_simd[simd_gid * ATTN_BQ + b] = simd_dot;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if ((int)tid < ATTN_BQ) {
+            float sum = 0;
+            for (int g = 0; g < n_simd_groups; g++)
+                sum += tg_simd[g * ATTN_BQ + (int)tid];
+            tg_scores[(int)tid] = sum * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        device const half *v_j = V + (long)j * stride_kv + kv_h * head_dim;
+        float v_val = (int)tid < head_dim ? float(v_j[tid]) : 0.0f;
+
+        for (int b = 0; b < ATTN_BQ; b++) {
+            int qi = qi_start + b;
+            if (qi >= seq_q) continue;
+            int q_pos = q_offset + qi;
+            int vs = (window_size > 0) ? max(0, q_pos - window_size + 1) : 0;
+            if (j < vs || j > q_pos) continue;
+
+            float score = tg_scores[b];
+            float old_max = rmax[b];
+            rmax[b] = fmax(rmax[b], score);
+            float corr = exp(old_max - rmax[b]);
+            rsum[b] = rsum[b] * corr + exp(score - rmax[b]);
+            acc[b] = acc[b] * corr + exp(score - rmax[b]) * v_val;
+        }
+    }
+
+    if ((int)tid < head_dim) {
+        for (int b = 0; b < ATTN_BQ; b++) {
+            int qi = qi_start + b;
+            if (qi < seq_q) {
+                device float *out_row = out + (long)qi * stride_q + h * head_dim;
+                out_row[tid] = acc[b] / (rsum[b] + 1e-10f);
+            }
+        }
+    }
+}
+
+kernel void encoder_attention_qstrided(
+    device const float *Q [[buffer(0)]],
+    device const float *K [[buffer(1)]],
+    device const float *V [[buffer(2)]],
+    device float *out [[buffer(3)]],
+    constant int &n_heads [[buffer(4)]],
+    constant int &n_kv_heads [[buffer(5)]],
+    constant int &head_dim [[buffer(6)]],
+    constant int &seq_q [[buffer(7)]],
+    constant int &seq_k [[buffer(8)]],
+    constant float &scale [[buffer(9)]],
+    constant int &window_size [[buffer(10)]],
+    constant int &q_offset [[buffer(11)]],
+    constant int &q_stride [[buffer(12)]],
+    constant int &q_col_offset [[buffer(13)]],
+    uint group_idx [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    int n_q_blocks = (seq_q + ATTN_BQ - 1) / ATTN_BQ;
+    int h = (int)group_idx / n_q_blocks;
+    int qb = (int)group_idx % n_q_blocks;
+    int qi_start = qb * ATTN_BQ;
+    if (h >= n_heads) return;
+
+    int gqa_ratio = n_heads / n_kv_heads;
+    int kv_h = h / gqa_ratio;
+    int stride_q_out = n_heads * head_dim;
+    int stride_kv = n_kv_heads * head_dim;
+    int n_simd_groups = (int)tg_size / 32;
+
+    float q_vals[ATTN_BQ];
+    for (int b = 0; b < ATTN_BQ; b++) {
+        int qi = qi_start + b;
+        q_vals[b] = (qi < seq_q && (int)tid < head_dim)
+            ? Q[(long)qi * q_stride + q_col_offset + h * head_dim + tid] : 0.0f;
+    }
+
+    float rmax[ATTN_BQ], rsum[ATTN_BQ], acc[ATTN_BQ];
+    for (int b = 0; b < ATTN_BQ; b++) {
+        rmax[b] = -INFINITY;
+        rsum[b] = 0.0f;
+        acc[b] = 0.0f;
+    }
+
+    threadgroup float tg_simd[4 * ATTN_BQ];
+    threadgroup float tg_scores[ATTN_BQ];
+
+    int last_qi = min(qi_start + ATTN_BQ - 1, seq_q - 1);
+    int first_pos = q_offset + qi_start;
+    int last_pos = q_offset + last_qi;
+    int loop_start = (window_size > 0) ? max(0, first_pos - window_size + 1) : 0;
+    int loop_end = min(last_pos, seq_k - 1);
+
+    for (int j = loop_start; j <= loop_end; j++) {
+        device const float *k_j = K + (long)j * stride_kv + kv_h * head_dim;
+        float k_val = (int)tid < head_dim ? k_j[tid] : 0.0f;
+
+        for (int b = 0; b < ATTN_BQ; b++) {
+            float simd_dot = simd_sum(q_vals[b] * k_val);
+            if (simd_lid == 0) tg_simd[simd_gid * ATTN_BQ + b] = simd_dot;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if ((int)tid < ATTN_BQ) {
+            float sum = 0;
+            for (int g = 0; g < n_simd_groups; g++)
+                sum += tg_simd[g * ATTN_BQ + (int)tid];
+            tg_scores[(int)tid] = sum * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        device const float *v_j = V + (long)j * stride_kv + kv_h * head_dim;
+        float v_val = (int)tid < head_dim ? v_j[tid] : 0.0f;
+
+        for (int b = 0; b < ATTN_BQ; b++) {
+            int qi = qi_start + b;
+            if (qi >= seq_q) continue;
+            int q_pos = q_offset + qi;
+            int vs = (window_size > 0) ? max(0, q_pos - window_size + 1) : 0;
+            if (j < vs || j > q_pos) continue;
+
+            float score = tg_scores[b];
+            float old_max = rmax[b];
+            rmax[b] = fmax(rmax[b], score);
+            float corr = exp(old_max - rmax[b]);
+            rsum[b] = rsum[b] * corr + exp(score - rmax[b]);
+            acc[b] = acc[b] * corr + exp(score - rmax[b]) * v_val;
+        }
+    }
+
+    if ((int)tid < head_dim) {
+        for (int b = 0; b < ATTN_BQ; b++) {
+            int qi = qi_start + b;
+            if (qi < seq_q) {
+                device float *out_row = out + (long)qi * stride_q_out + h * head_dim;
+                out_row[tid] = acc[b] / (rsum[b] + 1e-10f);
+            }
+        }
+    }
+}
+
+kernel void encoder_attention_kv_f16_qstrided(
+    device const float *Q [[buffer(0)]],
+    device const half *K [[buffer(1)]],
+    device const half *V [[buffer(2)]],
+    device float *out [[buffer(3)]],
+    constant int &n_heads [[buffer(4)]],
+    constant int &n_kv_heads [[buffer(5)]],
+    constant int &head_dim [[buffer(6)]],
+    constant int &seq_q [[buffer(7)]],
+    constant int &seq_k [[buffer(8)]],
+    constant float &scale [[buffer(9)]],
+    constant int &window_size [[buffer(10)]],
+    constant int &q_offset [[buffer(11)]],
+    constant int &q_stride [[buffer(12)]],
+    constant int &q_col_offset [[buffer(13)]],
+    uint group_idx [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    int n_q_blocks = (seq_q + ATTN_BQ - 1) / ATTN_BQ;
+    int h = (int)group_idx / n_q_blocks;
+    int qb = (int)group_idx % n_q_blocks;
+    int qi_start = qb * ATTN_BQ;
+    if (h >= n_heads) return;
+
+    int gqa_ratio = n_heads / n_kv_heads;
+    int kv_h = h / gqa_ratio;
+    int stride_q_out = n_heads * head_dim;
+    int stride_kv = n_kv_heads * head_dim;
+    int n_simd_groups = (int)tg_size / 32;
+
+    float q_vals[ATTN_BQ];
+    for (int b = 0; b < ATTN_BQ; b++) {
+        int qi = qi_start + b;
+        q_vals[b] = (qi < seq_q && (int)tid < head_dim)
+            ? Q[(long)qi * q_stride + q_col_offset + h * head_dim + tid] : 0.0f;
+    }
+
+    float rmax[ATTN_BQ], rsum[ATTN_BQ], acc[ATTN_BQ];
+    for (int b = 0; b < ATTN_BQ; b++) {
+        rmax[b] = -INFINITY;
+        rsum[b] = 0.0f;
+        acc[b] = 0.0f;
+    }
+
+    threadgroup float tg_simd[4 * ATTN_BQ];
+    threadgroup float tg_scores[ATTN_BQ];
+
+    int last_qi = min(qi_start + ATTN_BQ - 1, seq_q - 1);
+    int first_pos = q_offset + qi_start;
+    int last_pos = q_offset + last_qi;
+    int loop_start = (window_size > 0) ? max(0, first_pos - window_size + 1) : 0;
+    int loop_end = min(last_pos, seq_k - 1);
+
+    for (int j = loop_start; j <= loop_end; j++) {
+        device const half *k_j = K + (long)j * stride_kv + kv_h * head_dim;
+        float k_val = (int)tid < head_dim ? float(k_j[tid]) : 0.0f;
+
+        for (int b = 0; b < ATTN_BQ; b++) {
+            float simd_dot = simd_sum(q_vals[b] * k_val);
+            if (simd_lid == 0) tg_simd[simd_gid * ATTN_BQ + b] = simd_dot;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if ((int)tid < ATTN_BQ) {
+            float sum = 0;
+            for (int g = 0; g < n_simd_groups; g++)
+                sum += tg_simd[g * ATTN_BQ + (int)tid];
+            tg_scores[(int)tid] = sum * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        device const half *v_j = V + (long)j * stride_kv + kv_h * head_dim;
+        float v_val = (int)tid < head_dim ? float(v_j[tid]) : 0.0f;
+
+        for (int b = 0; b < ATTN_BQ; b++) {
+            int qi = qi_start + b;
+            if (qi >= seq_q) continue;
+            int q_pos = q_offset + qi;
+            int vs = (window_size > 0) ? max(0, q_pos - window_size + 1) : 0;
+            if (j < vs || j > q_pos) continue;
+
+            float score = tg_scores[b];
+            float old_max = rmax[b];
+            rmax[b] = fmax(rmax[b], score);
+            float corr = exp(old_max - rmax[b]);
+            rsum[b] = rsum[b] * corr + exp(score - rmax[b]);
+            acc[b] = acc[b] * corr + exp(score - rmax[b]) * v_val;
+        }
+    }
+
+    if ((int)tid < head_dim) {
+        for (int b = 0; b < ATTN_BQ; b++) {
+            int qi = qi_start + b;
+            if (qi < seq_q) {
+                device float *out_row = out + (long)qi * stride_q_out + h * head_dim;
+                out_row[tid] = acc[b] / (rsum[b] + 1e-10f);
+            }
+        }
+    }
+}
+
 /* ========================================================================
  * Bias add: data[s * dim + j] += bias[j] for each row s.
  * data: [seq_len, dim], bias: [dim].
@@ -495,6 +893,21 @@ kernel void bias_add(
     if ((int)gid < total) {
         data[gid] += bias[gid % dim];
     }
+}
+
+kernel void bias_add_strided(
+    device float *data [[buffer(0)]],
+    device const float *bias [[buffer(1)]],
+    constant int &row_stride [[buffer(2)]],
+    constant int &chunk_cols [[buffer(3)]],
+    constant int &col_offset [[buffer(4)]],
+    constant int &total [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if ((int)gid >= total) return;
+    int row = (int)gid / chunk_cols;
+    int col = (int)gid % chunk_cols;
+    data[row * row_stride + col_offset + col] += bias[col];
 }
 
 /* ========================================================================
@@ -532,6 +945,37 @@ kernel void batched_rope_apply(
     data[base + i * 2 + 1] = x0 * sin_val + x1 * cos_val;
 }
 
+kernel void batched_rope_apply_strided(
+    device float *data [[buffer(0)]],
+    device const float *freqs [[buffer(1)]],
+    constant int &n_heads [[buffer(2)]],
+    constant int &head_dim [[buffer(3)]],
+    constant int &seq_len [[buffer(4)]],
+    constant int &row_stride [[buffer(5)]],
+    constant int &col_offset [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    int half_dim = head_dim / 2;
+    int per_pos = n_heads * half_dim;
+    int total = seq_len * per_pos;
+    if ((int)gid >= total) return;
+
+    int pos = (int)gid / per_pos;
+    int rem = (int)gid % per_pos;
+    int head = rem / half_dim;
+    int i = rem % half_dim;
+
+    float cos_val = freqs[(pos * half_dim + i) * 2];
+    float sin_val = freqs[(pos * half_dim + i) * 2 + 1];
+
+    int base = pos * row_stride + col_offset + head * head_dim;
+    float x0 = data[base + i * 2];
+    float x1 = data[base + i * 2 + 1];
+
+    data[base + i * 2]     = x0 * cos_val - x1 * sin_val;
+    data[base + i * 2 + 1] = x0 * sin_val + x1 * cos_val;
+}
+
 /* ========================================================================
  * Batched KV cache copy: write [seq_len, kv_dim] to cache at offset.
  * cache: large buffer, data copied to cache[cache_offset + gid].
@@ -547,6 +991,50 @@ kernel void batched_kv_cache_copy(
     if ((int)gid < total) {
         cache[cache_offset + gid] = data[gid];
     }
+}
+
+kernel void batched_kv_cache_copy_f16(
+    device half *cache [[buffer(0)]],
+    device const float *data [[buffer(1)]],
+    constant int &cache_offset [[buffer(2)]],
+    constant int &total [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if ((int)gid < total) {
+        cache[cache_offset + gid] = half(data[gid]);
+    }
+}
+
+kernel void batched_kv_cache_copy_strided(
+    device float *cache [[buffer(0)]],
+    device const float *data [[buffer(1)]],
+    constant int &cache_offset [[buffer(2)]],
+    constant int &src_stride [[buffer(3)]],
+    constant int &src_col_offset [[buffer(4)]],
+    constant int &chunk_cols [[buffer(5)]],
+    constant int &total [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if ((int)gid >= total) return;
+    int row = (int)gid / chunk_cols;
+    int col = (int)gid % chunk_cols;
+    cache[cache_offset + gid] = data[row * src_stride + src_col_offset + col];
+}
+
+kernel void batched_kv_cache_copy_strided_f16(
+    device half *cache [[buffer(0)]],
+    device const float *data [[buffer(1)]],
+    constant int &cache_offset [[buffer(2)]],
+    constant int &src_stride [[buffer(3)]],
+    constant int &src_col_offset [[buffer(4)]],
+    constant int &chunk_cols [[buffer(5)]],
+    constant int &total [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if ((int)gid >= total) return;
+    int row = (int)gid / chunk_cols;
+    int col = (int)gid % chunk_cols;
+    cache[cache_offset + gid] = half(data[row * src_stride + src_col_offset + col]);
 }
 
 /* ========================================================================
@@ -592,4 +1080,162 @@ kernel void silu_mul_merged(
     float g = data[idx_gate];
     g = g / (1.0f + exp(-g));  /* silu */
     data[idx_gate] = g * data[idx_up];
+}
+
+/* ========================================================================
+ * Decoder FFN gate kernel (M=1):
+ * out[h] = silu(dot(x, w1[h])) * dot(x, w3[h])
+ * w1 and w3 are stored merged in rows [0:hidden) and [hidden:2*hidden).
+ * ======================================================================== */
+
+kernel void decoder_ffn_gate(
+    device const float *x [[buffer(0)]],
+    device const half *w_merged [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    constant int &dim [[buffer(3)]],
+    constant int &hidden [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if ((int)row >= hidden) return;
+
+    device const half *w1 = w_merged + (long)row * dim;
+    device const half *w3 = w_merged + (long)(row + hidden) * dim;
+
+    float sum1 = 0.0f;
+    float sum3 = 0.0f;
+    int i = (int)tid * 4;
+    for (; i + 3 < dim; i += (int)tg_size * 4) {
+        float4 xv = float4(x[i], x[i + 1], x[i + 2], x[i + 3]);
+        half4 w1v = *((device const half4 *)(w1 + i));
+        half4 w3v = *((device const half4 *)(w3 + i));
+        sum1 += dot(xv, float4(w1v));
+        sum3 += dot(xv, float4(w3v));
+    }
+    for (; i < dim; i += (int)tg_size) {
+        float xv = x[i];
+        sum1 += xv * float(w1[i]);
+        sum3 += xv * float(w3[i]);
+    }
+
+    float s1 = simd_sum(sum1);
+    float s3 = simd_sum(sum3);
+
+    const int max_simd_groups = 8; /* 256 threads / 32 lanes */
+    threadgroup float tg_s1[max_simd_groups];
+    threadgroup float tg_s3[max_simd_groups];
+    if (simd_lid == 0) {
+        tg_s1[simd_gid] = s1;
+        tg_s3[simd_gid] = s3;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        int n_groups = ((int)tg_size + 31) / 32;
+        float d1 = 0.0f;
+        float d3 = 0.0f;
+        for (int g = 0; g < n_groups; g++) {
+            d1 += tg_s1[g];
+            d3 += tg_s3[g];
+        }
+        float gate = d1 / (1.0f + exp(-d1));
+        out[row] = gate * d3;
+    }
+}
+
+/* ========================================================================
+ * Decoder FFN W2 + residual add kernel (M=1):
+ * x[d] += dot(gate[0:hidden], w2[d, 0:hidden])
+ * ======================================================================== */
+
+kernel void decoder_w2_residual(
+    device float *x [[buffer(0)]],
+    device const float *gate [[buffer(1)]],
+    device const half *w2 [[buffer(2)]],
+    constant int &hidden [[buffer(3)]],
+    constant int &dim [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if ((int)row >= dim) return;
+
+    device const half *w = w2 + (long)row * hidden;
+
+    float sum = 0.0f;
+    int i = (int)tid * 4;
+    for (; i + 3 < hidden; i += (int)tg_size * 4) {
+        float4 gv = float4(gate[i], gate[i + 1], gate[i + 2], gate[i + 3]);
+        half4 wv = *((device const half4 *)(w + i));
+        sum += dot(gv, float4(wv));
+    }
+    for (; i < hidden; i += (int)tg_size) {
+        sum += gate[i] * float(w[i]);
+    }
+
+    float s = simd_sum(sum);
+
+    const int max_simd_groups = 8; /* 256 threads / 32 lanes */
+    threadgroup float tg_s[max_simd_groups];
+    if (simd_lid == 0) tg_s[simd_gid] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        int n_groups = ((int)tg_size + 31) / 32;
+        float dot = 0.0f;
+        for (int g = 0; g < n_groups; g++) dot += tg_s[g];
+        x[row] += dot;
+    }
+}
+
+/* ========================================================================
+ * Decoder WO + residual add kernel (M=1):
+ * x[d] += dot(attn[0:q_dim], wo[d, 0:q_dim])
+ * ======================================================================== */
+
+kernel void decoder_wo_residual(
+    device float *x [[buffer(0)]],
+    device const float *attn [[buffer(1)]],
+    device const half *wo [[buffer(2)]],
+    constant int &q_dim [[buffer(3)]],
+    constant int &dim [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if ((int)row >= dim) return;
+
+    device const half *w = wo + (long)row * q_dim;
+
+    float sum = 0.0f;
+    int i = (int)tid * 4;
+    for (; i + 3 < q_dim; i += (int)tg_size * 4) {
+        float4 av = float4(attn[i], attn[i + 1], attn[i + 2], attn[i + 3]);
+        half4 wv = *((device const half4 *)(w + i));
+        sum += dot(av, float4(wv));
+    }
+    for (; i < q_dim; i += (int)tg_size) {
+        sum += attn[i] * float(w[i]);
+    }
+
+    float s = simd_sum(sum);
+
+    const int max_simd_groups = 8; /* 256 threads / 32 lanes */
+    threadgroup float tg_s[max_simd_groups];
+    if (simd_lid == 0) tg_s[simd_gid] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        int n_groups = ((int)tg_size + 31) / 32;
+        float dot = 0.0f;
+        for (int g = 0; g < n_groups; g++) dot += tg_s[g];
+        x[row] += dot;
+    }
 }

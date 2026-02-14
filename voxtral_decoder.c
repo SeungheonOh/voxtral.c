@@ -111,30 +111,102 @@ int vox_decoder_load(vox_decoder_t *dec, safetensors_file_t *sf) {
  * KV Cache Management
  * ======================================================================== */
 
+static inline float f16_to_f32(uint16_t h) {
+    uint32_t sign = ((uint32_t)h & 0x8000u) << 16;
+    uint32_t exp = ((uint32_t)h >> 10) & 0x1Fu;
+    uint32_t mant = (uint32_t)h & 0x03FFu;
+    uint32_t out_bits;
+
+    if (exp == 0) {
+        if (mant == 0) {
+            out_bits = sign;
+        } else {
+            exp = 1;
+            while ((mant & 0x0400u) == 0) {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x03FFu;
+            out_bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1Fu) {
+        out_bits = sign | 0x7F800000u | (mant << 13);
+    } else {
+        out_bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+    }
+
+    float f;
+    memcpy(&f, &out_bits, sizeof(f));
+    return f;
+}
+
+static int kv_cache_is_allocated(const vox_ctx_t *ctx) {
+    if (ctx->kv_cache_fp16) {
+        return ctx->kv_cache_k_f16 && ctx->kv_cache_v_f16;
+    }
+    return ctx->kv_cache_k && ctx->kv_cache_v;
+}
+
+/* Get cache pointers for layer at position */
+static float *kv_cache_k_at(vox_ctx_t *ctx, int layer, int pos) {
+    int kv_dim = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM;
+    return ctx->kv_cache_k + ((size_t)layer * ctx->kv_cache_max + pos) * kv_dim;
+}
+
+static float *kv_cache_v_at(vox_ctx_t *ctx, int layer, int pos) {
+    int kv_dim = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM;
+    return ctx->kv_cache_v + ((size_t)layer * ctx->kv_cache_max + pos) * kv_dim;
+}
+
+static uint16_t *kv_cache_k_f16_at(vox_ctx_t *ctx, int layer, int pos) {
+    int kv_dim = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM;
+    return ctx->kv_cache_k_f16 + ((size_t)layer * ctx->kv_cache_max + pos) * kv_dim;
+}
+
+static uint16_t *kv_cache_v_f16_at(vox_ctx_t *ctx, int layer, int pos) {
+    int kv_dim = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM;
+    return ctx->kv_cache_v_f16 + ((size_t)layer * ctx->kv_cache_max + pos) * kv_dim;
+}
+
 static int kv_cache_init(vox_ctx_t *ctx, int max_seq) {
     int kv_dim = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM; /* 8 * 128 = 1024 */
-    size_t cache_size = (size_t)VOX_DEC_LAYERS * max_seq * kv_dim * sizeof(float);
+    size_t elems = (size_t)VOX_DEC_LAYERS * max_seq * kv_dim;
+    size_t cache_size_f32 = elems * sizeof(float);
+    size_t cache_size_f16 = elems * sizeof(uint16_t);
+
+    ctx->kv_cache_k = NULL;
+    ctx->kv_cache_v = NULL;
+    ctx->kv_cache_k_f16 = NULL;
+    ctx->kv_cache_v_f16 = NULL;
 
 #ifdef USE_METAL
-    if (vox_metal_available()) {
-        ctx->kv_cache_k = (float *)vox_metal_shared_alloc(cache_size);
-        ctx->kv_cache_v = (float *)vox_metal_shared_alloc(cache_size);
-    } else
-#endif
-    {
-        ctx->kv_cache_k = (float *)calloc(1, cache_size);
-        ctx->kv_cache_v = (float *)calloc(1, cache_size);
+    if (vox_metal_available() && ctx->kv_cache_fp16) {
+        ctx->kv_cache_k_f16 = (uint16_t *)vox_metal_shared_alloc(cache_size_f16);
+        ctx->kv_cache_v_f16 = (uint16_t *)vox_metal_shared_alloc(cache_size_f16);
+    } else if (vox_metal_available()) {
+        ctx->kv_cache_k = (float *)vox_metal_shared_alloc(cache_size_f32);
+        ctx->kv_cache_v = (float *)vox_metal_shared_alloc(cache_size_f32);
+    } else {
+        ctx->kv_cache_fp16 = 0;
+        ctx->kv_cache_k = (float *)calloc(1, cache_size_f32);
+        ctx->kv_cache_v = (float *)calloc(1, cache_size_f32);
     }
+#else
+    ctx->kv_cache_fp16 = 0;
+    ctx->kv_cache_k = (float *)calloc(1, cache_size_f32);
+    ctx->kv_cache_v = (float *)calloc(1, cache_size_f32);
+#endif
+
     ctx->kv_cache_len = 0;
     ctx->kv_cache_max = max_seq;
     /* kv_pos_offset is NOT reset here — caller manages it */
 
-    if (!ctx->kv_cache_k || !ctx->kv_cache_v) return -1;
+    if (!kv_cache_is_allocated(ctx)) return -1;
     return 0;
 }
 
 int vox_decoder_kv_cache_preallocate(vox_ctx_t *ctx, int max_seq) {
-    if (ctx->kv_cache_k) return 0; /* already allocated */
+    if (kv_cache_is_allocated(ctx)) return 0; /* already allocated */
     return kv_cache_init(ctx, max_seq);
 }
 
@@ -148,11 +220,59 @@ static int kv_cache_grow(vox_ctx_t *ctx, int required) {
 
     size_t new_stride = (size_t)new_max * kv_dim;
     size_t old_stride = (size_t)ctx->kv_cache_max * kv_dim;
-    size_t total = (size_t)VOX_DEC_LAYERS * new_stride * sizeof(float);
+    size_t elems = (size_t)VOX_DEC_LAYERS * new_stride;
 
+    int use_fp16 = ctx->kv_cache_fp16;
+#ifdef USE_METAL
+    int use_shared = vox_metal_available();
+#endif
+
+    if (use_fp16) {
+        size_t total = elems * sizeof(uint16_t);
+        uint16_t *new_k = NULL, *new_v = NULL;
+#ifdef USE_METAL
+        if (use_shared) {
+            new_k = (uint16_t *)vox_metal_shared_alloc(total);
+            new_v = (uint16_t *)vox_metal_shared_alloc(total);
+        } else
+#endif
+        {
+            new_k = (uint16_t *)calloc(1, total);
+            new_v = (uint16_t *)calloc(1, total);
+        }
+        if (!new_k || !new_v) {
+#ifdef USE_METAL
+            vox_metal_shared_free(new_k);
+            vox_metal_shared_free(new_v);
+#else
+            free(new_k); free(new_v);
+#endif
+            return -1;
+        }
+
+        size_t copy = (size_t)ctx->kv_cache_len * kv_dim * sizeof(uint16_t);
+        for (int l = 0; l < VOX_DEC_LAYERS; l++) {
+            memcpy(new_k + l * new_stride, ctx->kv_cache_k_f16 + l * old_stride, copy);
+            memcpy(new_v + l * new_stride, ctx->kv_cache_v_f16 + l * old_stride, copy);
+        }
+
+#ifdef USE_METAL
+        vox_metal_shared_free(ctx->kv_cache_k_f16);
+        vox_metal_shared_free(ctx->kv_cache_v_f16);
+#else
+        free(ctx->kv_cache_k_f16);
+        free(ctx->kv_cache_v_f16);
+#endif
+        ctx->kv_cache_k_f16 = new_k;
+        ctx->kv_cache_v_f16 = new_v;
+        ctx->kv_cache_max = new_max;
+        return 0;
+    }
+
+    size_t total = elems * sizeof(float);
     float *new_k, *new_v;
 #ifdef USE_METAL
-    if (vox_metal_available()) {
+    if (use_shared) {
         new_k = (float *)vox_metal_shared_alloc(total);
         new_v = (float *)vox_metal_shared_alloc(total);
     } else
@@ -190,17 +310,6 @@ static int kv_cache_grow(vox_ctx_t *ctx, int required) {
     return 0;
 }
 
-/* Get K cache pointer for layer at position */
-static float *kv_cache_k_at(vox_ctx_t *ctx, int layer, int pos) {
-    int kv_dim = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM;
-    return ctx->kv_cache_k + ((size_t)layer * ctx->kv_cache_max + pos) * kv_dim;
-}
-
-static float *kv_cache_v_at(vox_ctx_t *ctx, int layer, int pos) {
-    int kv_dim = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM;
-    return ctx->kv_cache_v + ((size_t)layer * ctx->kv_cache_max + pos) * kv_dim;
-}
-
 /* Compact KV cache: discard entries older than the sliding window.
  * Keeps the last VOX_DEC_WINDOW entries, moves them to position 0,
  * and updates kv_pos_offset so RoPE positions remain correct.
@@ -211,19 +320,87 @@ static void kv_cache_compact(vox_ctx_t *ctx) {
 
     int discard = ctx->kv_cache_len - keep;
     int kv_dim = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM;
-    size_t keep_bytes = (size_t)keep * kv_dim * sizeof(float);
-
-    for (int l = 0; l < VOX_DEC_LAYERS; l++) {
-        float *k_base = kv_cache_k_at(ctx, l, 0);
-        float *k_src  = kv_cache_k_at(ctx, l, discard);
-        float *v_base = kv_cache_v_at(ctx, l, 0);
-        float *v_src  = kv_cache_v_at(ctx, l, discard);
-        memmove(k_base, k_src, keep_bytes);
-        memmove(v_base, v_src, keep_bytes);
+    if (ctx->kv_cache_fp16) {
+        size_t keep_bytes = (size_t)keep * kv_dim * sizeof(uint16_t);
+        for (int l = 0; l < VOX_DEC_LAYERS; l++) {
+            uint16_t *k_base = kv_cache_k_f16_at(ctx, l, 0);
+            uint16_t *k_src  = kv_cache_k_f16_at(ctx, l, discard);
+            uint16_t *v_base = kv_cache_v_f16_at(ctx, l, 0);
+            uint16_t *v_src  = kv_cache_v_f16_at(ctx, l, discard);
+            memmove(k_base, k_src, keep_bytes);
+            memmove(v_base, v_src, keep_bytes);
+        }
+    } else {
+        size_t keep_bytes = (size_t)keep * kv_dim * sizeof(float);
+        for (int l = 0; l < VOX_DEC_LAYERS; l++) {
+            float *k_base = kv_cache_k_at(ctx, l, 0);
+            float *k_src  = kv_cache_k_at(ctx, l, discard);
+            float *v_base = kv_cache_v_at(ctx, l, 0);
+            float *v_src  = kv_cache_v_at(ctx, l, discard);
+            memmove(k_base, k_src, keep_bytes);
+            memmove(v_base, v_src, keep_bytes);
+        }
     }
 
     ctx->kv_pos_offset += discard;
     ctx->kv_cache_len = keep;
+}
+
+/* Materialize fp32 cache from fp16 cache and switch runtime to fp32 mode. */
+static int kv_cache_switch_to_fp32(vox_ctx_t *ctx) {
+    if (!ctx->kv_cache_fp16) return 0;
+    if (!ctx->kv_cache_k_f16 || !ctx->kv_cache_v_f16) return -1;
+
+    int kv_dim = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM;
+    size_t stride = (size_t)ctx->kv_cache_max * kv_dim;
+    size_t total = (size_t)VOX_DEC_LAYERS * stride * sizeof(float);
+    size_t copy = (size_t)ctx->kv_cache_len * kv_dim;
+
+    float *new_k = NULL, *new_v = NULL;
+#ifdef USE_METAL
+    if (vox_metal_available()) {
+        new_k = (float *)vox_metal_shared_alloc(total);
+        new_v = (float *)vox_metal_shared_alloc(total);
+    } else
+#endif
+    {
+        new_k = (float *)calloc(1, total);
+        new_v = (float *)calloc(1, total);
+    }
+    if (!new_k || !new_v) {
+#ifdef USE_METAL
+        vox_metal_shared_free(new_k);
+        vox_metal_shared_free(new_v);
+#else
+        free(new_k); free(new_v);
+#endif
+        return -1;
+    }
+
+    for (int l = 0; l < VOX_DEC_LAYERS; l++) {
+        const uint16_t *src_k = ctx->kv_cache_k_f16 + (size_t)l * stride;
+        const uint16_t *src_v = ctx->kv_cache_v_f16 + (size_t)l * stride;
+        float *dst_k = new_k + (size_t)l * stride;
+        float *dst_v = new_v + (size_t)l * stride;
+        for (size_t i = 0; i < copy; i++) {
+            dst_k[i] = f16_to_f32(src_k[i]);
+            dst_v[i] = f16_to_f32(src_v[i]);
+        }
+    }
+
+#ifdef USE_METAL
+    vox_metal_shared_free(ctx->kv_cache_k_f16);
+    vox_metal_shared_free(ctx->kv_cache_v_f16);
+#else
+    free(ctx->kv_cache_k_f16);
+    free(ctx->kv_cache_v_f16);
+#endif
+    ctx->kv_cache_k_f16 = NULL;
+    ctx->kv_cache_v_f16 = NULL;
+    ctx->kv_cache_k = new_k;
+    ctx->kv_cache_v = new_v;
+    ctx->kv_cache_fp16 = 0;
+    return 0;
 }
 
 /* ========================================================================
@@ -241,7 +418,7 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
     int kv_dim = n_kv_heads * head_dim; /* 1024 */
 
     /* Ensure KV cache is allocated and large enough */
-    if (!ctx->kv_cache_k) {
+    if (!kv_cache_is_allocated(ctx)) {
         if (kv_cache_init(ctx, VOX_DEC_WINDOW + seq_len + 1024) != 0) return;
     } else if (ctx->kv_cache_len + seq_len > ctx->kv_cache_max) {
         if (kv_cache_grow(ctx, ctx->kv_cache_len + seq_len + 1024) != 0) return;
@@ -277,6 +454,14 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
         return;
     }
 #endif
+
+    /* CPU prefill path requires fp32 KV cache. */
+    if (ctx->kv_cache_fp16 && kv_cache_switch_to_fp32(ctx) != 0) {
+        free(x); free(x_norm); free(q); free(k); free(v);
+        free(attn_out); free(proj_out); free(ffn_out);
+        free(positions); free(rope_freqs);
+        return;
+    }
 
     for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {
         vox_dec_layer_t *l = &dec->layers[layer];
@@ -458,6 +643,11 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
          * Fall through to CPU path. */
     }
 #endif
+
+    /* CPU path requires fp32 KV cache. */
+    if (ctx->kv_cache_fp16 && kv_cache_switch_to_fp32(ctx) != 0) {
+        return 2;
+    }
 
     /* CPU fallback path */
     for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {

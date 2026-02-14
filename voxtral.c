@@ -119,6 +119,7 @@ vox_ctx_t *vox_load(const char *model_dir) {
     strncpy(ctx->model_dir, model_dir, sizeof(ctx->model_dir) - 1);
     ctx->delay_tokens = 6; /* 480ms default */
     ctx->use_bf16 = 1; /* bf16 mmap direct mode */
+    ctx->kv_cache_fp16 = 0; /* default: fp32 KV cache */
 
     /* Open safetensors file */
     char path[1024];
@@ -161,6 +162,9 @@ vox_ctx_t *vox_load(const char *model_dir) {
 #ifdef USE_METAL
     /* Pre-warm Metal bf16->f16 weight cache to avoid first-token spike */
     if (vox_metal_available()) {
+        const char *kv_env = getenv("VOX_DECODER_KV_FP16");
+        ctx->kv_cache_fp16 = (!kv_env || atoi(kv_env) != 0) ? 1 : 0;
+
         if (vox_verbose >= 2)
             fprintf(stderr, "Pre-warming Metal weight cache...\n");
 
@@ -232,6 +236,10 @@ vox_ctx_t *vox_load(const char *model_dir) {
         /* Pre-allocate KV cache (shared GPU memory) */
         vox_decoder_kv_cache_preallocate(ctx, VOX_DEC_WINDOW + 1024);
 
+        if (vox_verbose >= 1)
+            fprintf(stderr, "Decoder KV cache: %s\n",
+                    ctx->kv_cache_fp16 ? "fp16" : "fp32");
+
         /* Pre-allocate encoder KV cache (shared GPU memory for monolithic step) */
         vox_encoder_kv_cache_preallocate(ctx, VOX_ENC_WINDOW + 256);
 
@@ -288,9 +296,13 @@ void vox_free(vox_ctx_t *ctx) {
 #ifdef USE_METAL
     vox_metal_shared_free(ctx->kv_cache_k);
     vox_metal_shared_free(ctx->kv_cache_v);
+    vox_metal_shared_free(ctx->kv_cache_k_f16);
+    vox_metal_shared_free(ctx->kv_cache_v_f16);
 #else
     free(ctx->kv_cache_k);
     free(ctx->kv_cache_v);
+    free(ctx->kv_cache_k_f16);
+    free(ctx->kv_cache_v_f16);
 #endif
 #ifdef USE_METAL
     if (ctx->enc_kv_cache_is_shared) {
