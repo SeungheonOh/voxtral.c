@@ -46,13 +46,29 @@ static uint16_t *load_bf16_direct(safetensors_file_t *sf, const char *name) {
     return safetensors_get_bf16_direct(sf, t);
 }
 
+static void load_q8_direct(safetensors_file_t *sf, const char *name,
+                           int8_t **data_out, float **scales_out) {
+    const safetensor_t *t = safetensors_find(sf, name);
+    if (!t || !safetensor_is_q8(t)) { *data_out = NULL; *scales_out = NULL; return; }
+    *data_out = safetensors_get_q8_data_direct(sf, t);
+    *scales_out = safetensors_get_q8_scales_direct(sf, t);
+}
+
 int vox_decoder_load(vox_decoder_t *dec, safetensors_file_t *sf) {
     char name[512];
 
     /* Token embeddings (large, bf16 mmap direct) */
     dec->tok_embeddings_bf16 = load_bf16_direct(sf,
         "mm_streams_embeddings.embedding_module.tok_embeddings.weight");
-    if (!dec->tok_embeddings_bf16) return -1;
+    if (!dec->tok_embeddings_bf16) {
+        const safetensor_t *t = safetensors_find(sf,
+            "mm_streams_embeddings.embedding_module.tok_embeddings.weight");
+        if (t && safetensor_is_q8(t)) {
+            dec->tok_embeddings_q8 = safetensors_get_q8_data_direct(sf, t);
+            dec->tok_embeddings_scale_q8 = safetensors_get_q8_scales_direct(sf, t);
+        }
+    }
+    if (!dec->tok_embeddings_bf16 && !dec->tok_embeddings_q8) return -1;
 
     /* Transformer layers */
     for (int i = 0; i < VOX_DEC_LAYERS; i++) {
@@ -90,8 +106,29 @@ int vox_decoder_load(vox_decoder_t *dec, safetensors_file_t *sf) {
         snprintf(name, sizeof(name), "layers.%d.ffn_norm.weight", i);
         l->ffn_norm = load_f32(sf, name);
 
-        if (!l->wq_weight_bf16 || !l->wk_weight_bf16 ||
-            !l->wv_weight_bf16 || !l->wo_weight_bf16) {
+        /* If BF16 pointers are NULL, try Q8 */
+        if (!l->wq_weight_bf16) {
+            snprintf(name, sizeof(name), "layers.%d.attention.wq.weight", i);
+            load_q8_direct(sf, name, &l->wq_weight_q8, &l->wq_scale_q8);
+            snprintf(name, sizeof(name), "layers.%d.attention.wk.weight", i);
+            load_q8_direct(sf, name, &l->wk_weight_q8, &l->wk_scale_q8);
+            snprintf(name, sizeof(name), "layers.%d.attention.wv.weight", i);
+            load_q8_direct(sf, name, &l->wv_weight_q8, &l->wv_scale_q8);
+            snprintf(name, sizeof(name), "layers.%d.attention.wo.weight", i);
+            load_q8_direct(sf, name, &l->wo_weight_q8, &l->wo_scale_q8);
+            snprintf(name, sizeof(name), "layers.%d.feed_forward.w1.weight", i);
+            load_q8_direct(sf, name, &l->w1_weight_q8, &l->w1_scale_q8);
+            snprintf(name, sizeof(name), "layers.%d.feed_forward.w2.weight", i);
+            load_q8_direct(sf, name, &l->w2_weight_q8, &l->w2_scale_q8);
+            snprintf(name, sizeof(name), "layers.%d.feed_forward.w3.weight", i);
+            load_q8_direct(sf, name, &l->w3_weight_q8, &l->w3_scale_q8);
+        }
+
+        int has_bf16 = l->wq_weight_bf16 && l->wk_weight_bf16 &&
+                       l->wv_weight_bf16 && l->wo_weight_bf16;
+        int has_q8 = l->wq_weight_q8 && l->wk_weight_q8 &&
+                     l->wv_weight_q8 && l->wo_weight_q8;
+        if (!has_bf16 && !has_q8) {
             fprintf(stderr, "decoder: failed to load layer %d\n", i);
             return -1;
         }
@@ -471,7 +508,7 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
 
         /* Q, K, V projections (no bias in decoder, bf16 weights) */
 #ifdef USE_METAL
-        if (vox_metal_available()) {
+        if (vox_metal_available() && l->wq_weight_bf16) {
             vox_metal_fused_qkv_bf16(seq_len, dim, x_norm,
                                       l->wq_weight_bf16, q_dim,
                                       l->wk_weight_bf16, kv_dim,
@@ -480,9 +517,15 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
         } else
 #endif
         {
-            vox_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, seq_len, dim, q_dim);
-            vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, seq_len, dim, kv_dim);
-            vox_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, seq_len, dim, kv_dim);
+            if (l->wq_weight_q8) {
+                vox_linear_nobias_q8(q, x_norm, l->wq_weight_q8, l->wq_scale_q8, seq_len, dim, q_dim);
+                vox_linear_nobias_q8(k, x_norm, l->wk_weight_q8, l->wk_scale_q8, seq_len, dim, kv_dim);
+                vox_linear_nobias_q8(v, x_norm, l->wv_weight_q8, l->wv_scale_q8, seq_len, dim, kv_dim);
+            } else {
+                vox_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, seq_len, dim, q_dim);
+                vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, seq_len, dim, kv_dim);
+                vox_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, seq_len, dim, kv_dim);
+            }
         }
 
         /* Apply RoPE */
@@ -508,7 +551,10 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
                              head_dim, scale, VOX_DEC_WINDOW, start_pos);
 
         /* Output projection + residual */
-        vox_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, seq_len, q_dim, dim);
+        if (l->wo_weight_q8)
+            vox_linear_nobias_q8(proj_out, attn_out, l->wo_weight_q8, l->wo_scale_q8, seq_len, q_dim, dim);
+        else
+            vox_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, seq_len, q_dim, dim);
         vox_add_inplace(x, proj_out, seq_len * dim);
 
         /* ---- FFN ---- */
@@ -525,7 +571,7 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
 
         /* SwiGLU */
 #ifdef USE_METAL
-        if (vox_metal_available()) {
+        if (vox_metal_available() && l->w1_weight_bf16) {
             vox_metal_fused_ffn_bf16(seq_len, dim, hidden, x_norm,
                                       l->w1_weight_bf16, l->w3_weight_bf16,
                                       l->w2_weight_bf16, ffn_out);
@@ -535,11 +581,19 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
             /* CPU path needs separate gate/up buffers */
             float *gate = (float *)malloc(seq_len * hidden * sizeof(float));
             float *up = (float *)malloc(seq_len * hidden * sizeof(float));
-            vox_linear_nobias_bf16(gate, x_norm, l->w1_weight_bf16, seq_len, dim, hidden);
-            vox_silu(gate, seq_len * hidden);
-            vox_linear_nobias_bf16(up, x_norm, l->w3_weight_bf16, seq_len, dim, hidden);
-            vox_mul_inplace(gate, up, seq_len * hidden);
-            vox_linear_nobias_bf16(ffn_out, gate, l->w2_weight_bf16, seq_len, hidden, dim);
+            if (l->w1_weight_q8) {
+                vox_linear_nobias_q8(gate, x_norm, l->w1_weight_q8, l->w1_scale_q8, seq_len, dim, hidden);
+                vox_silu(gate, seq_len * hidden);
+                vox_linear_nobias_q8(up, x_norm, l->w3_weight_q8, l->w3_scale_q8, seq_len, dim, hidden);
+                vox_mul_inplace(gate, up, seq_len * hidden);
+                vox_linear_nobias_q8(ffn_out, gate, l->w2_weight_q8, l->w2_scale_q8, seq_len, hidden, dim);
+            } else {
+                vox_linear_nobias_bf16(gate, x_norm, l->w1_weight_bf16, seq_len, dim, hidden);
+                vox_silu(gate, seq_len * hidden);
+                vox_linear_nobias_bf16(up, x_norm, l->w3_weight_bf16, seq_len, dim, hidden);
+                vox_mul_inplace(gate, up, seq_len * hidden);
+                vox_linear_nobias_bf16(ffn_out, gate, l->w2_weight_bf16, seq_len, hidden, dim);
+            }
             free(gate); free(up);
         }
 
@@ -654,9 +708,15 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
         vox_dec_layer_t *l = &dec->layers[layer];
 
         vox_rms_norm(x_norm, x, l->attention_norm, 1, dim, VOX_DEC_NORM_EPS);
-        vox_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, 1, dim, q_dim);
-        vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, 1, dim, kv_dim);
-        vox_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, 1, dim, kv_dim);
+        if (l->wq_weight_q8) {
+            vox_linear_nobias_q8(q, x_norm, l->wq_weight_q8, l->wq_scale_q8, 1, dim, q_dim);
+            vox_linear_nobias_q8(k, x_norm, l->wk_weight_q8, l->wk_scale_q8, 1, dim, kv_dim);
+            vox_linear_nobias_q8(v, x_norm, l->wv_weight_q8, l->wv_scale_q8, 1, dim, kv_dim);
+        } else {
+            vox_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, 1, dim, q_dim);
+            vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, 1, dim, kv_dim);
+            vox_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, 1, dim, kv_dim);
+        }
 
         vox_apply_rope(q, rope_freqs, 1, n_heads, head_dim);
         vox_apply_rope(k, rope_freqs, 1, n_kv_heads, head_dim);
@@ -672,7 +732,10 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
                              1, total_seq, n_heads, n_kv_heads,
                              head_dim, scale, VOX_DEC_WINDOW, pos);
 
-        vox_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, 1, q_dim, dim);
+        if (l->wo_weight_q8)
+            vox_linear_nobias_q8(proj_out, attn_out, l->wo_weight_q8, l->wo_scale_q8, 1, q_dim, dim);
+        else
+            vox_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, 1, q_dim, dim);
         vox_add_inplace(x, proj_out, dim);
 
         vox_rms_norm(x_norm, x, l->ffn_norm, 1, dim, VOX_DEC_NORM_EPS);
@@ -681,18 +744,29 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
             for (int i = 0; i < dim; i++) x_norm[i] *= (1.0f + ada_s[i]);
         }
 
-        vox_linear_nobias_bf16(gate_buf, x_norm, l->w1_weight_bf16, 1, dim, hidden);
-        vox_silu(gate_buf, hidden);
-        vox_linear_nobias_bf16(up_buf, x_norm, l->w3_weight_bf16, 1, dim, hidden);
-        vox_mul_inplace(gate_buf, up_buf, hidden);
-        vox_linear_nobias_bf16(ffn_out, gate_buf, l->w2_weight_bf16, 1, hidden, dim);
+        if (l->w1_weight_q8) {
+            vox_linear_nobias_q8(gate_buf, x_norm, l->w1_weight_q8, l->w1_scale_q8, 1, dim, hidden);
+            vox_silu(gate_buf, hidden);
+            vox_linear_nobias_q8(up_buf, x_norm, l->w3_weight_q8, l->w3_scale_q8, 1, dim, hidden);
+            vox_mul_inplace(gate_buf, up_buf, hidden);
+            vox_linear_nobias_q8(ffn_out, gate_buf, l->w2_weight_q8, l->w2_scale_q8, 1, hidden, dim);
+        } else {
+            vox_linear_nobias_bf16(gate_buf, x_norm, l->w1_weight_bf16, 1, dim, hidden);
+            vox_silu(gate_buf, hidden);
+            vox_linear_nobias_bf16(up_buf, x_norm, l->w3_weight_bf16, 1, dim, hidden);
+            vox_mul_inplace(gate_buf, up_buf, hidden);
+            vox_linear_nobias_bf16(ffn_out, gate_buf, l->w2_weight_bf16, 1, hidden, dim);
+        }
         vox_add_inplace(x, ffn_out, dim);
     }
 
     ctx->kv_cache_len = pos + 1;
 
     vox_rms_norm(x, x, dec->norm, 1, dim, VOX_DEC_NORM_EPS);
-    vox_matmul_t_bf16(logits, x, dec->tok_embeddings_bf16, 1, dim, VOX_VOCAB_SIZE);
+    if (dec->tok_embeddings_q8)
+        vox_matmul_t_q8(logits, x, dec->tok_embeddings_q8, dec->tok_embeddings_scale_q8, 1, dim, VOX_VOCAB_SIZE);
+    else
+        vox_matmul_t_bf16(logits, x, dec->tok_embeddings_bf16, 1, dim, VOX_VOCAB_SIZE);
 
     int best = 0;
     float best_val = logits[0];

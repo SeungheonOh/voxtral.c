@@ -24,6 +24,7 @@ typedef enum {
     DTYPE_I32 = 3,
     DTYPE_I64 = 4,
     DTYPE_BOOL = 5,
+    DTYPE_Q8 = 6,
     DTYPE_UNKNOWN = -1
 } safetensor_dtype_t;
 
@@ -74,6 +75,19 @@ uint16_t *safetensors_get_bf16_direct(const safetensors_file_t *sf, const safete
 
 /* Check if tensor is stored in bf16 format */
 int safetensor_is_bf16(const safetensor_t *t);
+
+/* Check if tensor is stored in Q8 format */
+int safetensor_is_q8(const safetensor_t *t);
+
+/* Get direct pointer to Q8 scales in mmap'd region (no copy, caller must NOT free)
+ * For tensor shape [rows, cols]: returns float* pointing to rows float32 scale values.
+ * Only works for Q8 tensors. Returns NULL for other dtypes. */
+float *safetensors_get_q8_scales_direct(const safetensors_file_t *sf, const safetensor_t *t);
+
+/* Get direct pointer to Q8 int8 data in mmap'd region (no copy, caller must NOT free)
+ * For tensor shape [rows, cols]: returns int8_t* pointing to rows*cols int8 values.
+ * Data starts after the scales region. Only works for Q8 tensors. */
+int8_t *safetensors_get_q8_data_direct(const safetensors_file_t *sf, const safetensor_t *t);
 
 /* Get total number of elements in tensor */
 int64_t safetensor_numel(const safetensor_t *t);

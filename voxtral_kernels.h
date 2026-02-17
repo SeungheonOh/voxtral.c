@@ -68,6 +68,28 @@ void vox_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
 void vox_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
                        int M, int K, int N);
 
+/*
+ * Linear layer with Q8 weights (no bias)
+ * x: [seq_len, in_dim] (f32), W: [out_dim, in_dim] (int8), scales: [out_dim] (f32)
+ * y: [seq_len, out_dim] (f32). Computes: y[r] = scales[r] * dot(x, W[r])
+ */
+void vox_linear_nobias_q8(float *y, const float *x, const int8_t *W_q8,
+                           const float *scales, int seq_len, int in_dim, int out_dim);
+
+/*
+ * Linear layer with Q8 weights and f32 bias
+ */
+void vox_linear_q8(float *y, const float *x, const int8_t *W_q8,
+                    const float *scales, const float *b,
+                    int seq_len, int in_dim, int out_dim);
+
+/*
+ * Matrix multiplication with transposed Q8 B: C = A @ B^T
+ * A: [M, K] (f32), B: [N, K] (int8), scales: [N] (f32), C: [M, N] (f32)
+ */
+void vox_matmul_t_q8(float *C, const float *A, const int8_t *B_q8,
+                      const float *scales, int M, int K, int N);
+
 /* ========================================================================
  * 1D Convolution (for audio encoder conv stem)
  * ======================================================================== */

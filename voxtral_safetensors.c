@@ -64,6 +64,7 @@ static safetensor_dtype_t parse_dtype(const char *s) {
     if (strcmp(s, "I32") == 0) return DTYPE_I32;
     if (strcmp(s, "I64") == 0) return DTYPE_I64;
     if (strcmp(s, "BOOL") == 0) return DTYPE_BOOL;
+    if (strcmp(s, "Q8") == 0) return DTYPE_Q8;
     return DTYPE_UNKNOWN;
 }
 
@@ -358,8 +359,10 @@ float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) 
     if (n <= 0) return NULL;
 
     /* Validate element count fits within data region */
-    size_t elem_size = (t->dtype == DTYPE_F32) ? 4 : 2;
-    if ((size_t)n * elem_size > t->data_size) return NULL;
+    if (t->dtype != DTYPE_Q8) {
+        size_t elem_size = (t->dtype == DTYPE_F32) ? 4 : 2;
+        if ((size_t)n * elem_size > t->data_size) return NULL;
+    }
 
     float *out = malloc(n * sizeof(float));
     if (!out) return NULL;
@@ -383,6 +386,25 @@ float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t) 
             const uint16_t *src = (const uint16_t *)data;
             for (int64_t i = 0; i < n; i++) {
                 out[i] = bf16_to_f32(src[i]);
+            }
+            break;
+        }
+
+        case DTYPE_Q8: {
+            /* Q8 layout: [rows * float scales][rows * cols * int8 data] */
+            if (t->ndim != 2) {
+                fprintf(stderr, "safetensors_get_f32: Q8 requires 2D tensor\n");
+                free(out);
+                return NULL;
+            }
+            int64_t rows = t->shape[0], cols = t->shape[1];
+            const float *scales = (const float *)data;
+            const int8_t *q8 = (const int8_t *)((const char *)data + rows * sizeof(float));
+            for (int64_t r = 0; r < rows; r++) {
+                float s = scales[r];
+                for (int64_t c = 0; c < cols; c++) {
+                    out[r * cols + c] = (float)q8[r * cols + c] * s;
+                }
             }
             break;
         }
@@ -428,9 +450,26 @@ uint16_t *safetensors_get_bf16_direct(const safetensors_file_t *sf, const safete
     return (uint16_t *)safetensors_data(sf, t);
 }
 
+int safetensor_is_q8(const safetensor_t *t) {
+    return t && t->dtype == DTYPE_Q8;
+}
+
+float *safetensors_get_q8_scales_direct(const safetensors_file_t *sf, const safetensor_t *t) {
+    if (!sf || !t) return NULL;
+    if (t->dtype != DTYPE_Q8) return NULL;
+    return (float *)safetensors_data(sf, t);
+}
+
+int8_t *safetensors_get_q8_data_direct(const safetensors_file_t *sf, const safetensor_t *t) {
+    if (!sf || !t) return NULL;
+    if (t->dtype != DTYPE_Q8) return NULL;
+    int64_t rows = t->shape[0];
+    return (int8_t *)((const char *)safetensors_data(sf, t) + rows * sizeof(float));
+}
+
 void safetensor_print(const safetensor_t *t) {
-    const char *dtype_names[] = {"F32", "F16", "BF16", "I32", "I64", "BOOL"};
-    const char *dtype_name = t->dtype >= 0 && t->dtype <= 5 ?
+    const char *dtype_names[] = {"F32", "F16", "BF16", "I32", "I64", "BOOL", "Q8"};
+    const char *dtype_name = t->dtype >= 0 && t->dtype <= 6 ?
                              dtype_names[t->dtype] : "UNKNOWN";
 
     printf("%s: dtype=%s, shape=[", t->name, dtype_name);

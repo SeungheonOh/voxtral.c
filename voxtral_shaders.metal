@@ -1239,3 +1239,165 @@ kernel void decoder_wo_residual(
         x[row] += dot;
     }
 }
+
+/* ========================================================================
+ * Q8 Decoder FFN gate+up kernel (M=1):
+ * out[h] = silu(dot(x, w1_q8[h]) * s1[h]) * (dot(x, w3_q8[h]) * s3[h])
+ * ======================================================================== */
+
+kernel void decoder_ffn_gate_q8(
+    device const float *x [[buffer(0)]],
+    device const char *w_merged_q8 [[buffer(1)]],
+    device const float *scales [[buffer(2)]],
+    device float *out [[buffer(3)]],
+    constant int &dim [[buffer(4)]],
+    constant int &hidden [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if ((int)row >= hidden) return;
+
+    device const char *w1 = w_merged_q8 + (long)row * dim;
+    device const char *w3 = w_merged_q8 + (long)(row + hidden) * dim;
+
+    float sum1 = 0.0f;
+    float sum3 = 0.0f;
+    int i = (int)tid * 4;
+    for (; i + 3 < dim; i += (int)tg_size * 4) {
+        float4 xv = float4(x[i], x[i + 1], x[i + 2], x[i + 3]);
+        char4 w1v = *((device const char4 *)(w1 + i));
+        char4 w3v = *((device const char4 *)(w3 + i));
+        sum1 += dot(xv, float4(w1v));
+        sum3 += dot(xv, float4(w3v));
+    }
+    for (; i < dim; i += (int)tg_size) {
+        float xv = x[i];
+        sum1 += xv * float(w1[i]);
+        sum3 += xv * float(w3[i]);
+    }
+
+    float s1 = simd_sum(sum1);
+    float s3 = simd_sum(sum3);
+
+    const int max_simd_groups = 8;
+    threadgroup float tg_s1[max_simd_groups];
+    threadgroup float tg_s3[max_simd_groups];
+    if (simd_lid == 0) {
+        tg_s1[simd_gid] = s1;
+        tg_s3[simd_gid] = s3;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        int n_groups = ((int)tg_size + 31) / 32;
+        float d1 = 0.0f;
+        float d3 = 0.0f;
+        for (int g = 0; g < n_groups; g++) {
+            d1 += tg_s1[g];
+            d3 += tg_s3[g];
+        }
+        d1 *= scales[row];           // w1 scale
+        d3 *= scales[row + hidden];  // w3 scale
+        float gate = d1 / (1.0f + exp(-d1));
+        out[row] = gate * d3;
+    }
+}
+
+/* ========================================================================
+ * Q8 Decoder W2 + residual add kernel (M=1):
+ * x[d] += dot(gate[0:hidden], w2_q8[d, 0:hidden]) * scales[d]
+ * ======================================================================== */
+
+kernel void decoder_w2_residual_q8(
+    device float *x [[buffer(0)]],
+    device const float *gate [[buffer(1)]],
+    device const char *w2_q8 [[buffer(2)]],
+    device const float *scales [[buffer(3)]],
+    constant int &hidden [[buffer(4)]],
+    constant int &dim [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if ((int)row >= dim) return;
+
+    device const char *w = w2_q8 + (long)row * hidden;
+
+    float sum = 0.0f;
+    int i = (int)tid * 4;
+    for (; i + 3 < hidden; i += (int)tg_size * 4) {
+        float4 gv = float4(gate[i], gate[i + 1], gate[i + 2], gate[i + 3]);
+        char4 wv = *((device const char4 *)(w + i));
+        sum += dot(gv, float4(wv));
+    }
+    for (; i < hidden; i += (int)tg_size) {
+        sum += gate[i] * float(w[i]);
+    }
+
+    float s = simd_sum(sum);
+
+    const int max_simd_groups = 8;
+    threadgroup float tg_s[max_simd_groups];
+    if (simd_lid == 0) tg_s[simd_gid] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        int n_groups = ((int)tg_size + 31) / 32;
+        float d = 0.0f;
+        for (int g = 0; g < n_groups; g++) d += tg_s[g];
+        x[row] += d * scales[row];
+    }
+}
+
+/* ========================================================================
+ * Q8 Decoder WO + residual add kernel (M=1):
+ * x[d] += dot(attn[0:q_dim], wo_q8[d, 0:q_dim]) * scales[d]
+ * ======================================================================== */
+
+kernel void decoder_wo_residual_q8(
+    device float *x [[buffer(0)]],
+    device const float *attn [[buffer(1)]],
+    device const char *wo_q8 [[buffer(2)]],
+    device const float *scales [[buffer(3)]],
+    constant int &q_dim [[buffer(4)]],
+    constant int &dim [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if ((int)row >= dim) return;
+
+    device const char *w = wo_q8 + (long)row * q_dim;
+
+    float sum = 0.0f;
+    int i = (int)tid * 4;
+    for (; i + 3 < q_dim; i += (int)tg_size * 4) {
+        float4 av = float4(attn[i], attn[i + 1], attn[i + 2], attn[i + 3]);
+        char4 wv = *((device const char4 *)(w + i));
+        sum += dot(av, float4(wv));
+    }
+    for (; i < q_dim; i += (int)tg_size) {
+        sum += attn[i] * float(w[i]);
+    }
+
+    float s = simd_sum(sum);
+
+    const int max_simd_groups = 8;
+    threadgroup float tg_s[max_simd_groups];
+    if (simd_lid == 0) tg_s[simd_gid] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        int n_groups = ((int)tg_size + 31) / 32;
+        float d = 0.0f;
+        for (int g = 0; g < n_groups; g++) d += tg_s[g];
+        x[row] += d * scales[row];
+    }
+}

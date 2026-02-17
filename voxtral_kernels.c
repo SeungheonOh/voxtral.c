@@ -264,6 +264,135 @@ void vox_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
 }
 
 /* ========================================================================
+ * Q8 Quantized Matrix Operations
+ * ======================================================================== */
+
+/*
+ * Fused Q8 matvec: y[out_dim] = scales * (W_q8[out_dim, in_dim] @ x[in_dim]) + bias
+ *
+ * Reads int8 weights directly and converts in-register, avoiding the
+ * double-streaming penalty of "convert full matrix then BLAS".
+ * This is the critical fast path for single-token decoder generation.
+ */
+static void q8_matvec_fused(float *y, const float *x, const int8_t *W_q8,
+                              const float *scales, const float *bias,
+                              int in_dim, int out_dim) {
+    for (int o = 0; o < out_dim; o++) {
+        const int8_t *w_row = W_q8 + (size_t)o * in_dim;
+        float sum = 0.0f;
+        int k = 0;
+
+#ifdef __ARM_NEON
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+
+        for (; k + 8 <= in_dim; k += 8) {
+            /* Load 8 int8 weights, widen to int16, then to float32 */
+            int8x8_t w8 = vld1_s8(w_row + k);
+            int16x8_t w16 = vmovl_s8(w8);
+            float32x4_t w0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w16)));
+            float32x4_t w1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16)));
+
+            float32x4_t x0 = vld1q_f32(x + k);
+            float32x4_t x1 = vld1q_f32(x + k + 4);
+
+            acc0 = vfmaq_f32(acc0, w0, x0);
+            acc1 = vfmaq_f32(acc1, w1, x1);
+        }
+
+        sum += vaddvq_f32(vaddq_f32(acc0, acc1));
+#endif
+
+        for (; k < in_dim; k++) {
+            sum += (float)w_row[k] * x[k];
+        }
+
+        y[o] = sum * scales[o] + (bias ? bias[o] : 0.0f);
+    }
+}
+
+void vox_linear_nobias_q8(float *y, const float *x, const int8_t *W_q8,
+                           const float *scales, int seq_len, int in_dim, int out_dim) {
+#ifdef USE_METAL
+    if (vox_metal_available()) {
+        vox_metal_sgemm_q8(seq_len, out_dim, in_dim, x, W_q8, scales, y);
+        return;
+    }
+#endif
+    if (seq_len == 1) {
+        q8_matvec_fused(y, x, W_q8, scales, NULL, in_dim, out_dim);
+        return;
+    }
+    /* For M>1: dequantize to f32 and use existing BLAS path */
+    size_t n = (size_t)out_dim * in_dim;
+    float *W_f32 = bf16_get_scratch(n);
+    if (!W_f32) return;
+    for (int r = 0; r < out_dim; r++) {
+        float s = scales[r];
+        for (int c = 0; c < in_dim; c++) {
+            W_f32[r * in_dim + c] = (float)W_q8[r * in_dim + c] * s;
+        }
+    }
+    vox_linear_nobias(y, x, W_f32, seq_len, in_dim, out_dim);
+}
+
+void vox_linear_q8(float *y, const float *x, const int8_t *W_q8,
+                    const float *scales, const float *b,
+                    int seq_len, int in_dim, int out_dim) {
+#ifdef USE_METAL
+    if (vox_metal_available()) {
+        vox_metal_sgemm_q8(seq_len, out_dim, in_dim, x, W_q8, scales, y);
+        if (b != NULL) {
+            for (int s = 0; s < seq_len; s++) {
+                for (int o = 0; o < out_dim; o++) {
+                    y[s * out_dim + o] += b[o];
+                }
+            }
+        }
+        return;
+    }
+#endif
+    if (seq_len == 1) {
+        q8_matvec_fused(y, x, W_q8, scales, b, in_dim, out_dim);
+        return;
+    }
+    size_t n = (size_t)out_dim * in_dim;
+    float *W_f32 = bf16_get_scratch(n);
+    if (!W_f32) return;
+    for (int r = 0; r < out_dim; r++) {
+        float sc = scales[r];
+        for (int c = 0; c < in_dim; c++) {
+            W_f32[r * in_dim + c] = (float)W_q8[r * in_dim + c] * sc;
+        }
+    }
+    vox_linear(y, x, W_f32, b, seq_len, in_dim, out_dim);
+}
+
+void vox_matmul_t_q8(float *C, const float *A, const int8_t *B_q8,
+                      const float *scales, int M, int K, int N) {
+#ifdef USE_METAL
+    if (vox_metal_available()) {
+        vox_metal_sgemm_q8(M, N, K, A, B_q8, scales, C);
+        return;
+    }
+#endif
+    if (M == 1) {
+        q8_matvec_fused(C, A, B_q8, scales, NULL, K, N);
+        return;
+    }
+    size_t n = (size_t)N * K;
+    float *B_f32 = bf16_get_scratch(n);
+    if (!B_f32) return;
+    for (int r = 0; r < N; r++) {
+        float sc = scales[r];
+        for (int c = 0; c < K; c++) {
+            B_f32[r * K + c] = (float)B_q8[r * K + c] * sc;
+        }
+    }
+    vox_matmul_t(C, A, B_f32, M, K, N);
+}
+
+/* ========================================================================
  * 1D Convolution
  * ======================================================================== */
 

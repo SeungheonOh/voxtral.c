@@ -47,6 +47,14 @@ static uint16_t *load_bf16_direct(safetensors_file_t *sf, const char *name) {
     return safetensors_get_bf16_direct(sf, t);
 }
 
+static void load_q8_direct(safetensors_file_t *sf, const char *name,
+                           int8_t **data_out, float **scales_out) {
+    const safetensor_t *t = safetensors_find(sf, name);
+    if (!t || !safetensor_is_q8(t)) { *data_out = NULL; *scales_out = NULL; return; }
+    *data_out = safetensors_get_q8_data_direct(sf, t);
+    *scales_out = safetensors_get_q8_scales_direct(sf, t);
+}
+
 int vox_encoder_load(vox_encoder_t *enc, safetensors_file_t *sf) {
     char name[512];
 
@@ -83,6 +91,24 @@ int vox_encoder_load(vox_encoder_t *enc, safetensors_file_t *sf) {
         snprintf(name, sizeof(name), "%s.%d.feed_forward.w3.weight", lp, i);
         l->w3_weight_bf16 = load_bf16_direct(sf, name);
 
+        /* If BF16 pointers are NULL, try Q8 */
+        if (!l->wq_weight_bf16) {
+            snprintf(name, sizeof(name), "%s.%d.attention.wq.weight", lp, i);
+            load_q8_direct(sf, name, &l->wq_weight_q8, &l->wq_scale_q8);
+            snprintf(name, sizeof(name), "%s.%d.attention.wk.weight", lp, i);
+            load_q8_direct(sf, name, &l->wk_weight_q8, &l->wk_scale_q8);
+            snprintf(name, sizeof(name), "%s.%d.attention.wv.weight", lp, i);
+            load_q8_direct(sf, name, &l->wv_weight_q8, &l->wv_scale_q8);
+            snprintf(name, sizeof(name), "%s.%d.attention.wo.weight", lp, i);
+            load_q8_direct(sf, name, &l->wo_weight_q8, &l->wo_scale_q8);
+            snprintf(name, sizeof(name), "%s.%d.feed_forward.w1.weight", lp, i);
+            load_q8_direct(sf, name, &l->w1_weight_q8, &l->w1_scale_q8);
+            snprintf(name, sizeof(name), "%s.%d.feed_forward.w2.weight", lp, i);
+            load_q8_direct(sf, name, &l->w2_weight_q8, &l->w2_scale_q8);
+            snprintf(name, sizeof(name), "%s.%d.feed_forward.w3.weight", lp, i);
+            load_q8_direct(sf, name, &l->w3_weight_q8, &l->w3_scale_q8);
+        }
+
         /* Small weights: biases and norms (always f32) */
         snprintf(name, sizeof(name), "%s.%d.attention.wq.bias", lp, i);
         l->wq_bias = load_f32(sf, name);
@@ -98,8 +124,11 @@ int vox_encoder_load(vox_encoder_t *enc, safetensors_file_t *sf) {
         snprintf(name, sizeof(name), "%s.%d.ffn_norm.weight", lp, i);
         l->ffn_norm = load_f32(sf, name);
 
-        if (!l->wq_weight_bf16 || !l->wk_weight_bf16 ||
-            !l->wv_weight_bf16 || !l->wo_weight_bf16) {
+        int has_bf16 = l->wq_weight_bf16 && l->wk_weight_bf16 &&
+                       l->wv_weight_bf16 && l->wo_weight_bf16;
+        int has_q8 = l->wq_weight_q8 && l->wk_weight_q8 &&
+                     l->wv_weight_q8 && l->wo_weight_q8;
+        if (!has_bf16 && !has_q8) {
             fprintf(stderr, "encoder: failed to load layer %d weights\n", i);
             return -1;
         }
@@ -208,7 +237,7 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
 
         /* Q, K, V projections (bf16 weights, f32 biases) */
 #ifdef USE_METAL
-        if (vox_metal_available()) {
+        if (vox_metal_available() && l->wq_weight_bf16) {
             vox_metal_fused_qkv_bf16(seq_len, dim, x_norm,
                                       l->wq_weight_bf16, qkv_dim,
                                       l->wk_weight_bf16, qkv_dim,
@@ -221,14 +250,19 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
                     v[s * qkv_dim + j] += l->wv_bias[j];
                 }
             }
-        } else {
+        } else
 #endif
-            vox_linear_bf16(q, x_norm, l->wq_weight_bf16, l->wq_bias, seq_len, dim, qkv_dim);
-            vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, seq_len, dim, qkv_dim);
-            vox_linear_bf16(v, x_norm, l->wv_weight_bf16, l->wv_bias, seq_len, dim, qkv_dim);
-#ifdef USE_METAL
+        {
+            if (l->wq_weight_q8) {
+                vox_linear_q8(q, x_norm, l->wq_weight_q8, l->wq_scale_q8, l->wq_bias, seq_len, dim, qkv_dim);
+                vox_linear_nobias_q8(k, x_norm, l->wk_weight_q8, l->wk_scale_q8, seq_len, dim, qkv_dim);
+                vox_linear_q8(v, x_norm, l->wv_weight_q8, l->wv_scale_q8, l->wv_bias, seq_len, dim, qkv_dim);
+            } else {
+                vox_linear_bf16(q, x_norm, l->wq_weight_bf16, l->wq_bias, seq_len, dim, qkv_dim);
+                vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, seq_len, dim, qkv_dim);
+                vox_linear_bf16(v, x_norm, l->wv_weight_bf16, l->wv_bias, seq_len, dim, qkv_dim);
+            }
         }
-#endif
 
         /* Apply RoPE to Q and K */
         vox_apply_rope(q, rope_freqs, seq_len, n_heads, head_dim);
@@ -252,19 +286,21 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
 
         /* Output projection + residual */
 #ifdef USE_METAL
-        if (vox_metal_available()) {
+        if (vox_metal_available() && l->wo_weight_bf16) {
             vox_metal_sgemm_bf16(seq_len, dim, qkv_dim, attn_out,
                                    l->wo_weight_bf16, proj_out);
             /* Add wo bias on CPU */
             for (int s = 0; s < seq_len; s++)
                 for (int j = 0; j < dim; j++)
                     proj_out[s * dim + j] += l->wo_bias[j];
-        } else {
+        } else
 #endif
-            vox_linear_bf16(proj_out, attn_out, l->wo_weight_bf16, l->wo_bias, seq_len, qkv_dim, dim);
-#ifdef USE_METAL
+        {
+            if (l->wo_weight_q8)
+                vox_linear_q8(proj_out, attn_out, l->wo_weight_q8, l->wo_scale_q8, l->wo_bias, seq_len, qkv_dim, dim);
+            else
+                vox_linear_bf16(proj_out, attn_out, l->wo_weight_bf16, l->wo_bias, seq_len, qkv_dim, dim);
         }
-#endif
         vox_add_inplace(x, proj_out, seq_len * dim);
 
         /* ---- FFN ---- */
@@ -272,7 +308,7 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
 
         /* SwiGLU: gate = silu(w1(x)), up = w3(x), ffn = w2(gate * up) + bias */
 #ifdef USE_METAL
-        if (vox_metal_available()) {
+        if (vox_metal_available() && l->w1_weight_bf16) {
             vox_metal_fused_ffn_bf16(seq_len, dim, hidden, x_norm,
                                       l->w1_weight_bf16, l->w3_weight_bf16,
                                       l->w2_weight_bf16, ffn_out);
@@ -280,16 +316,23 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
             for (int s = 0; s < seq_len; s++)
                 for (int j = 0; j < dim; j++)
                     ffn_out[s * dim + j] += l->w2_bias[j];
-        } else {
+        } else
 #endif
-            vox_linear_nobias_bf16(gate, x_norm, l->w1_weight_bf16, seq_len, dim, hidden);
-            vox_silu(gate, seq_len * hidden);
-            vox_linear_nobias_bf16(up, x_norm, l->w3_weight_bf16, seq_len, dim, hidden);
-            vox_mul_inplace(gate, up, seq_len * hidden);
-            vox_linear_bf16(ffn_out, gate, l->w2_weight_bf16, l->w2_bias, seq_len, hidden, dim);
-#ifdef USE_METAL
+        {
+            if (l->w1_weight_q8) {
+                vox_linear_nobias_q8(gate, x_norm, l->w1_weight_q8, l->w1_scale_q8, seq_len, dim, hidden);
+                vox_silu(gate, seq_len * hidden);
+                vox_linear_nobias_q8(up, x_norm, l->w3_weight_q8, l->w3_scale_q8, seq_len, dim, hidden);
+                vox_mul_inplace(gate, up, seq_len * hidden);
+                vox_linear_q8(ffn_out, gate, l->w2_weight_q8, l->w2_scale_q8, l->w2_bias, seq_len, hidden, dim);
+            } else {
+                vox_linear_nobias_bf16(gate, x_norm, l->w1_weight_bf16, seq_len, dim, hidden);
+                vox_silu(gate, seq_len * hidden);
+                vox_linear_nobias_bf16(up, x_norm, l->w3_weight_bf16, seq_len, dim, hidden);
+                vox_mul_inplace(gate, up, seq_len * hidden);
+                vox_linear_bf16(ffn_out, gate, l->w2_weight_bf16, l->w2_bias, seq_len, hidden, dim);
+            }
         }
-#endif
 
         /* Residual */
         vox_add_inplace(x, ffn_out, seq_len * dim);
@@ -524,7 +567,7 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
 
         /* Q, K, V projections on new positions only */
 #ifdef USE_METAL
-        if (vox_metal_available()) {
+        if (vox_metal_available() && l->wq_weight_bf16) {
             vox_metal_fused_qkv_bf16(new_len, dim, x_norm,
                                       l->wq_weight_bf16, qkv_dim,
                                       l->wk_weight_bf16, qkv_dim,
@@ -537,14 +580,19 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
                     v[s * qkv_dim + j] += l->wv_bias[j];
                 }
             }
-        } else {
+        } else
 #endif
-            vox_linear_bf16(q, x_norm, l->wq_weight_bf16, l->wq_bias, new_len, dim, qkv_dim);
-            vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, new_len, dim, qkv_dim);
-            vox_linear_bf16(v, x_norm, l->wv_weight_bf16, l->wv_bias, new_len, dim, qkv_dim);
-#ifdef USE_METAL
+        {
+            if (l->wq_weight_q8) {
+                vox_linear_q8(q, x_norm, l->wq_weight_q8, l->wq_scale_q8, l->wq_bias, new_len, dim, qkv_dim);
+                vox_linear_nobias_q8(k, x_norm, l->wk_weight_q8, l->wk_scale_q8, new_len, dim, qkv_dim);
+                vox_linear_q8(v, x_norm, l->wv_weight_q8, l->wv_scale_q8, l->wv_bias, new_len, dim, qkv_dim);
+            } else {
+                vox_linear_bf16(q, x_norm, l->wq_weight_bf16, l->wq_bias, new_len, dim, qkv_dim);
+                vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, new_len, dim, qkv_dim);
+                vox_linear_bf16(v, x_norm, l->wv_weight_bf16, l->wv_bias, new_len, dim, qkv_dim);
+            }
         }
-#endif
 
         /* Apply RoPE to Q and K */
         vox_apply_rope(q, rope_freqs, new_len, n_heads, head_dim);
@@ -580,26 +628,28 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
 
         /* Output projection + residual */
 #ifdef USE_METAL
-        if (vox_metal_available()) {
+        if (vox_metal_available() && l->wo_weight_bf16) {
             vox_metal_sgemm_bf16(new_len, dim, qkv_dim, attn_out,
                                    l->wo_weight_bf16, proj_out);
             /* Add wo bias on CPU */
             for (int s = 0; s < new_len; s++)
                 for (int j = 0; j < dim; j++)
                     proj_out[s * dim + j] += l->wo_bias[j];
-        } else {
+        } else
 #endif
-            vox_linear_bf16(proj_out, attn_out, l->wo_weight_bf16, l->wo_bias, new_len, qkv_dim, dim);
-#ifdef USE_METAL
+        {
+            if (l->wo_weight_q8)
+                vox_linear_q8(proj_out, attn_out, l->wo_weight_q8, l->wo_scale_q8, l->wo_bias, new_len, qkv_dim, dim);
+            else
+                vox_linear_bf16(proj_out, attn_out, l->wo_weight_bf16, l->wo_bias, new_len, qkv_dim, dim);
         }
-#endif
         vox_add_inplace(x, proj_out, new_len * dim);
 
         /* ---- FFN ---- */
         vox_rms_norm(x_norm, x, l->ffn_norm, new_len, dim, VOX_ENC_NORM_EPS);
 
 #ifdef USE_METAL
-        if (vox_metal_available()) {
+        if (vox_metal_available() && l->w1_weight_bf16) {
             vox_metal_fused_ffn_bf16(new_len, dim, hidden, x_norm,
                                       l->w1_weight_bf16, l->w3_weight_bf16,
                                       l->w2_weight_bf16, ffn_out);
@@ -607,16 +657,23 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
             for (int s = 0; s < new_len; s++)
                 for (int j = 0; j < dim; j++)
                     ffn_out[s * dim + j] += l->w2_bias[j];
-        } else {
+        } else
 #endif
-            vox_linear_nobias_bf16(gate, x_norm, l->w1_weight_bf16, new_len, dim, hidden);
-            vox_silu(gate, new_len * hidden);
-            vox_linear_nobias_bf16(up, x_norm, l->w3_weight_bf16, new_len, dim, hidden);
-            vox_mul_inplace(gate, up, new_len * hidden);
-            vox_linear_bf16(ffn_out, gate, l->w2_weight_bf16, l->w2_bias, new_len, hidden, dim);
-#ifdef USE_METAL
+        {
+            if (l->w1_weight_q8) {
+                vox_linear_nobias_q8(gate, x_norm, l->w1_weight_q8, l->w1_scale_q8, new_len, dim, hidden);
+                vox_silu(gate, new_len * hidden);
+                vox_linear_nobias_q8(up, x_norm, l->w3_weight_q8, l->w3_scale_q8, new_len, dim, hidden);
+                vox_mul_inplace(gate, up, new_len * hidden);
+                vox_linear_q8(ffn_out, gate, l->w2_weight_q8, l->w2_scale_q8, l->w2_bias, new_len, hidden, dim);
+            } else {
+                vox_linear_nobias_bf16(gate, x_norm, l->w1_weight_bf16, new_len, dim, hidden);
+                vox_silu(gate, new_len * hidden);
+                vox_linear_nobias_bf16(up, x_norm, l->w3_weight_bf16, new_len, dim, hidden);
+                vox_mul_inplace(gate, up, new_len * hidden);
+                vox_linear_bf16(ffn_out, gate, l->w2_weight_bf16, l->w2_bias, new_len, hidden, dim);
+            }
         }
-#endif
 
         /* Residual */
         vox_add_inplace(x, ffn_out, new_len * dim);
@@ -660,11 +717,17 @@ float *vox_adapter_forward(vox_ctx_t *ctx, const float *enc_out,
 
     /* Linear(5120 -> 3072) -> GELU -> Linear(3072 -> 3072) */
     float *mid = (float *)malloc(ds_len * VOX_DEC_DIM * sizeof(float));
-    vox_linear_nobias_bf16(mid, ds, ctx->adapter.linear0_weight_bf16, ds_len, ds_dim, VOX_DEC_DIM);
+    if (ctx->adapter.linear0_weight_q8)
+        vox_linear_nobias_q8(mid, ds, ctx->adapter.linear0_weight_q8, ctx->adapter.linear0_scale_q8, ds_len, ds_dim, VOX_DEC_DIM);
+    else
+        vox_linear_nobias_bf16(mid, ds, ctx->adapter.linear0_weight_bf16, ds_len, ds_dim, VOX_DEC_DIM);
     vox_gelu(mid, ds_len * VOX_DEC_DIM);
 
     float *out = (float *)malloc(ds_len * VOX_DEC_DIM * sizeof(float));
-    vox_linear_nobias_bf16(out, mid, ctx->adapter.linear1_weight_bf16, ds_len, VOX_DEC_DIM, VOX_DEC_DIM);
+    if (ctx->adapter.linear1_weight_q8)
+        vox_linear_nobias_q8(out, mid, ctx->adapter.linear1_weight_q8, ctx->adapter.linear1_scale_q8, ds_len, VOX_DEC_DIM, VOX_DEC_DIM);
+    else
+        vox_linear_nobias_bf16(out, mid, ctx->adapter.linear1_weight_bf16, ds_len, VOX_DEC_DIM, VOX_DEC_DIM);
 
     free(ds);
     free(mid);

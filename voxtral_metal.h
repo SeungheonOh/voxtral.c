@@ -254,6 +254,26 @@ int vox_metal_encoder_full_step(void *ctx, float *x, int new_len,
 void vox_metal_decoder_prefill_step(void *ctx, float *x, int seq_len,
                                       const float *rope_freqs);
 
+/*
+ * GPU-accelerated matrix multiplication with Q8 weights.
+ * Dequantizes Q8 to F16, then uses MPS matmul (same as BF16 path).
+ * B_q8: [N, K] int8 row-major, scales: [N] float per-row scales.
+ */
+void vox_metal_sgemm_q8(int M, int N, int K,
+                          const float *A,
+                          const int8_t *B_q8, const float *scales,
+                          float *C);
+
+/*
+ * Pre-warm Q8 weight cache (Q8->F16 conversion for MPS, raw Q8 buffer for fused kernels).
+ */
+void vox_metal_warmup_q8(const int8_t *q8_data, const float *scales,
+                           int rows, int cols);
+
+/* Pre-warm merged Q8 buffers. */
+void vox_metal_warmup_merged_q8_2(const int8_t *a_q8, const float *a_scales, size_t a_rows, size_t a_cols,
+                                    const int8_t *b_q8, const float *b_scales, size_t b_rows, size_t b_cols);
+
 /* GPU memory usage (for debugging). */
 size_t vox_metal_memory_used(void);
 

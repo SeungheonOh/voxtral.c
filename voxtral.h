@@ -57,26 +57,40 @@ typedef struct {
     /* Attention weights (all have biases except wk) */
     float *wq_weight;        /* [2048, 1280] - f32 (NULL if bf16) */
     uint16_t *wq_weight_bf16;/* [2048, 1280] - bf16 mmap direct */
+    int8_t *wq_weight_q8;   /* [2048, 1280] - Q8 quantized (direct mmap) */
+    float  *wq_scale_q8;    /* [2048] - Q8 per-row scales (direct mmap) */
     float *wq_bias;          /* [2048] */
     float *wk_weight;        /* [2048, 1280] - f32 (NULL if bf16) */
     uint16_t *wk_weight_bf16;/* [2048, 1280] - bf16 mmap direct */
+    int8_t *wk_weight_q8;   /* [2048, 1280] - Q8 quantized (direct mmap) */
+    float  *wk_scale_q8;    /* [2048] - Q8 per-row scales (direct mmap) */
     /* wk has NO bias */
     float *wv_weight;        /* [2048, 1280] - f32 (NULL if bf16) */
     uint16_t *wv_weight_bf16;/* [2048, 1280] - bf16 mmap direct */
+    int8_t *wv_weight_q8;   /* [2048, 1280] - Q8 quantized (direct mmap) */
+    float  *wv_scale_q8;    /* [2048] - Q8 per-row scales (direct mmap) */
     float *wv_bias;          /* [2048] */
     float *wo_weight;        /* [1280, 2048] - f32 (NULL if bf16) */
     uint16_t *wo_weight_bf16;/* [1280, 2048] - bf16 mmap direct */
+    int8_t *wo_weight_q8;   /* [1280, 2048] - Q8 quantized (direct mmap) */
+    float  *wo_scale_q8;    /* [1280] - Q8 per-row scales (direct mmap) */
     float *wo_bias;          /* [1280] */
     float *attention_norm;   /* [1280] */
 
     /* Feed-forward (w1, w3 have no bias, w2 has bias) */
     float *w1_weight;        /* [5120, 1280] gate - f32 (NULL if bf16) */
     uint16_t *w1_weight_bf16;/* [5120, 1280] - bf16 mmap direct */
+    int8_t *w1_weight_q8;   /* [5120, 1280] - Q8 quantized (direct mmap) */
+    float  *w1_scale_q8;    /* [5120] - Q8 per-row scales (direct mmap) */
     float *w2_weight;        /* [1280, 5120] down - f32 (NULL if bf16) */
     uint16_t *w2_weight_bf16;/* [1280, 5120] - bf16 mmap direct */
+    int8_t *w2_weight_q8;   /* [1280, 5120] - Q8 quantized (direct mmap) */
+    float  *w2_scale_q8;    /* [1280] - Q8 per-row scales (direct mmap) */
     float *w2_bias;          /* [1280] */
     float *w3_weight;        /* [5120, 1280] up - f32 (NULL if bf16) */
     uint16_t *w3_weight_bf16;/* [5120, 1280] - bf16 mmap direct */
+    int8_t *w3_weight_q8;   /* [5120, 1280] - Q8 quantized (direct mmap) */
+    float  *w3_scale_q8;    /* [5120] - Q8 per-row scales (direct mmap) */
     float *ffn_norm;         /* [1280] */
 } vox_enc_layer_t;
 
@@ -106,21 +120,35 @@ typedef struct {
     /* Attention (no biases in decoder) */
     float *wq_weight;        /* [4096, 3072] - f32 (NULL if bf16) */
     uint16_t *wq_weight_bf16;/* [4096, 3072] - bf16 mmap direct */
+    int8_t *wq_weight_q8;   /* [4096, 3072] - Q8 quantized (direct mmap) */
+    float  *wq_scale_q8;    /* [4096] - Q8 per-row scales (direct mmap) */
     float *wk_weight;        /* [1024, 3072] - f32 (NULL if bf16) */
     uint16_t *wk_weight_bf16;/* [1024, 3072] - bf16 mmap direct */
+    int8_t *wk_weight_q8;   /* [1024, 3072] - Q8 quantized (direct mmap) */
+    float  *wk_scale_q8;    /* [1024] - Q8 per-row scales (direct mmap) */
     float *wv_weight;        /* [1024, 3072] - f32 (NULL if bf16) */
     uint16_t *wv_weight_bf16;/* [1024, 3072] - bf16 mmap direct */
+    int8_t *wv_weight_q8;   /* [1024, 3072] - Q8 quantized (direct mmap) */
+    float  *wv_scale_q8;    /* [1024] - Q8 per-row scales (direct mmap) */
     float *wo_weight;        /* [3072, 4096] - f32 (NULL if bf16) */
     uint16_t *wo_weight_bf16;/* [3072, 4096] - bf16 mmap direct */
+    int8_t *wo_weight_q8;   /* [3072, 4096] - Q8 quantized (direct mmap) */
+    float  *wo_scale_q8;    /* [3072] - Q8 per-row scales (direct mmap) */
     float *attention_norm;   /* [3072] */
 
     /* Feed-forward */
     float *w1_weight;        /* [9216, 3072] gate - f32 (NULL if bf16) */
     uint16_t *w1_weight_bf16;/* [9216, 3072] - bf16 mmap direct */
+    int8_t *w1_weight_q8;   /* [9216, 3072] - Q8 quantized (direct mmap) */
+    float  *w1_scale_q8;    /* [9216] - Q8 per-row scales (direct mmap) */
     float *w2_weight;        /* [3072, 9216] down - f32 (NULL if bf16) */
     uint16_t *w2_weight_bf16;/* [3072, 9216] - bf16 mmap direct */
+    int8_t *w2_weight_q8;   /* [3072, 9216] - Q8 quantized (direct mmap) */
+    float  *w2_scale_q8;    /* [3072] - Q8 per-row scales (direct mmap) */
     float *w3_weight;        /* [9216, 3072] up - f32 (NULL if bf16) */
     uint16_t *w3_weight_bf16;/* [9216, 3072] - bf16 mmap direct */
+    int8_t *w3_weight_q8;   /* [9216, 3072] - Q8 quantized (direct mmap) */
+    float  *w3_scale_q8;    /* [9216] - Q8 per-row scales (direct mmap) */
     float *ffn_norm;         /* [3072] */
 } vox_dec_layer_t;
 
@@ -128,6 +156,8 @@ typedef struct {
     /* Token embeddings (shared with output projection) */
     float *tok_embeddings;   /* [131072, 3072] - f32 (NULL if bf16) */
     uint16_t *tok_embeddings_bf16; /* [131072, 3072] - bf16 mmap direct */
+    int8_t *tok_embeddings_q8;    /* [131072, 3072] - Q8 quantized (direct mmap) */
+    float  *tok_embeddings_scale_q8; /* [131072] - Q8 per-row scales (direct mmap) */
 
     /* Transformer layers */
     vox_dec_layer_t layers[VOX_DEC_LAYERS];
@@ -143,8 +173,12 @@ typedef struct {
 typedef struct {
     float *linear0_weight;   /* [3072, 5120] - f32 (NULL if bf16) */
     uint16_t *linear0_weight_bf16; /* [3072, 5120] - bf16 mmap direct */
+    int8_t *linear0_weight_q8;    /* [3072, 5120] - Q8 quantized (direct mmap) */
+    float  *linear0_scale_q8;     /* [3072] - Q8 per-row scales (direct mmap) */
     float *linear1_weight;   /* [3072, 3072] - f32 (NULL if bf16) */
     uint16_t *linear1_weight_bf16; /* [3072, 3072] - bf16 mmap direct */
+    int8_t *linear1_weight_q8;    /* [3072, 3072] - Q8 quantized (direct mmap) */
+    float  *linear1_scale_q8;     /* [3072] - Q8 per-row scales (direct mmap) */
 } vox_adapter_t;
 
 /* ========================================================================
@@ -179,6 +213,7 @@ typedef struct {
 
     /* BF16 direct mmap mode (weights stay as bf16, convert on-the-fly) */
     int use_bf16;
+    int use_q8;              /* 1 if using Q8 quantized weights */
 
     /* Encoder KV cache (rolling: compacted at window=750) */
     float *enc_kv_cache_k;    /* [ENC_LAYERS, max_seq, enc_kv_dim] */

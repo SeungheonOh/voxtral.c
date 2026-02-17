@@ -64,6 +64,9 @@ static id<MTLComputePipelineState> g_silu_mul_merged_pipeline = nil;
 static id<MTLComputePipelineState> g_decoder_ffn_gate_pipeline = nil;
 static id<MTLComputePipelineState> g_decoder_w2_residual_pipeline = nil;
 static id<MTLComputePipelineState> g_decoder_wo_residual_pipeline = nil;
+static id<MTLComputePipelineState> g_decoder_ffn_gate_q8_pipeline = nil;
+static id<MTLComputePipelineState> g_decoder_w2_residual_q8_pipeline = nil;
+static id<MTLComputePipelineState> g_decoder_wo_residual_q8_pipeline = nil;
 
 /* GPU-shared memory tracking (zero-copy between CPU and GPU) */
 #define SHARED_ALLOC_MAX 8
@@ -156,6 +159,112 @@ static void clear_f16_cache(void) {
     pthread_mutex_unlock(&g_f16_cache_mutex);
 }
 
+static void evict_f16_cache_entry(const void *key) {
+    pthread_mutex_lock(&g_f16_cache_mutex);
+    for (int i = 0; i < g_f16_cache_count; i++) {
+        if (g_f16_cache[i].cpu_ptr == key) {
+            g_f16_cache[i].gpu_buffer = nil;
+            g_f16_cache[i] = g_f16_cache[g_f16_cache_count - 1];
+            g_f16_cache[g_f16_cache_count - 1].gpu_buffer = nil;
+            g_f16_cache[g_f16_cache_count - 1].cpu_ptr = NULL;
+            g_f16_cache_count--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_f16_cache_mutex);
+}
+
+/* ========================================================================
+ * Q8 -> F16 Conversion (dequantize Q8 int8 + per-row scale to f16)
+ * Reuses f16_cache keyed by q8_data pointer.
+ * ======================================================================== */
+
+static id<MTLBuffer> get_cached_q8_as_f16_buffer(const int8_t *q8_data, const float *scales,
+                                                    int rows, int cols) {
+    pthread_mutex_lock(&g_f16_cache_mutex);
+    for (int i = 0; i < g_f16_cache_count; i++) {
+        if (g_f16_cache[i].cpu_ptr == q8_data) {
+            id<MTLBuffer> buf = g_f16_cache[i].gpu_buffer;
+            pthread_mutex_unlock(&g_f16_cache_mutex);
+            return buf;
+        }
+    }
+
+    size_t num_elements = (size_t)rows * cols;
+    uint16_t *f16_data = (uint16_t *)malloc(num_elements * sizeof(uint16_t));
+    if (!f16_data) { pthread_mutex_unlock(&g_f16_cache_mutex); return nil; }
+
+    for (int r = 0; r < rows; r++) {
+        float scale = scales[r];
+        for (int c = 0; c < cols; c++) {
+            float val = (float)q8_data[(size_t)r * cols + c] * scale;
+            uint32_t f32_bits;
+            memcpy(&f32_bits, &val, sizeof(float));
+            uint32_t sign = (f32_bits >> 16) & 0x8000;
+            int32_t exp = ((f32_bits >> 23) & 0xFF) - 127 + 15;
+            uint32_t mant = (f32_bits >> 13) & 0x3FF;
+            uint16_t f16;
+            if (exp <= 0) f16 = (uint16_t)sign;
+            else if (exp >= 31) f16 = (uint16_t)(sign | 0x7C00);
+            else f16 = (uint16_t)(sign | (exp << 10) | mant);
+            f16_data[(size_t)r * cols + c] = f16;
+        }
+    }
+
+    size_t size = num_elements * sizeof(uint16_t);
+    id<MTLBuffer> buf = [g_device newBufferWithBytes:f16_data length:size
+                                             options:MTLResourceStorageModeShared];
+    free(f16_data);
+
+    if (buf && g_f16_cache_count < F16_WEIGHT_CACHE_SIZE) {
+        g_f16_cache[g_f16_cache_count].cpu_ptr = q8_data;
+        g_f16_cache[g_f16_cache_count].gpu_buffer = buf;
+        g_f16_cache[g_f16_cache_count].num_elements = num_elements;
+        g_f16_cache_count++;
+    }
+
+    pthread_mutex_unlock(&g_f16_cache_mutex);
+    return buf;
+}
+
+/* ========================================================================
+ * Q8 Raw Buffer Cache (int8 data for fused Q8 compute kernels)
+ * ======================================================================== */
+
+#define Q8_CACHE_SIZE 512
+
+typedef struct {
+    const void *cpu_ptr;
+    id<MTLBuffer> gpu_buffer;
+    size_t size;
+} q8_cache_entry_t;
+
+static q8_cache_entry_t g_q8_cache[Q8_CACHE_SIZE];
+static int g_q8_cache_count = 0;
+
+static id<MTLBuffer> get_cached_q8_buffer(const int8_t *data, size_t size) {
+    for (int i = 0; i < g_q8_cache_count; i++) {
+        if (g_q8_cache[i].cpu_ptr == data) return g_q8_cache[i].gpu_buffer;
+    }
+    id<MTLBuffer> buf = [g_device newBufferWithBytes:data length:size
+                                             options:MTLResourceStorageModeShared];
+    if (buf && g_q8_cache_count < Q8_CACHE_SIZE) {
+        g_q8_cache[g_q8_cache_count].cpu_ptr = data;
+        g_q8_cache[g_q8_cache_count].gpu_buffer = buf;
+        g_q8_cache[g_q8_cache_count].size = size;
+        g_q8_cache_count++;
+    }
+    return buf;
+}
+
+static void clear_q8_cache(void) {
+    for (int i = 0; i < g_q8_cache_count; i++) {
+        g_q8_cache[i].gpu_buffer = nil;
+        g_q8_cache[i].cpu_ptr = NULL;
+    }
+    g_q8_cache_count = 0;
+}
+
 /* ========================================================================
  * Merged F16 Weight Cache (concatenate two weight matrices for fused matmul)
  * ======================================================================== */
@@ -169,6 +278,12 @@ typedef struct {
 
 static merged_cache_entry_t g_merged_cache[MERGED_CACHE_SIZE];
 static int g_merged_count = 0;
+
+/* Separate cache for Q8 merged buffers (int8 data, NOT f16).
+ * Must not share g_merged_cache which stores f16 data — the prefill path
+ * caches f16 merged buffers keyed by Q8 pointers, causing type confusion. */
+static merged_cache_entry_t g_q8_merged_cache[MERGED_CACHE_SIZE];
+static int g_q8_merged_count = 0;
 
 /* Concatenate two bf16 weight matrices into a single f16 GPU buffer.
  * Result is [a_rows + b_rows, cols] where a is [a_rows, cols] and b is [b_rows, cols].
@@ -240,6 +355,50 @@ static void clear_merged_cache(void) {
         g_merged_cache[i].key2 = NULL;
     }
     g_merged_count = 0;
+    for (int i = 0; i < g_q8_merged_count; i++) {
+        g_q8_merged_cache[i].buffer = nil;
+        g_q8_merged_cache[i].key1 = NULL;
+        g_q8_merged_cache[i].key2 = NULL;
+    }
+    g_q8_merged_count = 0;
+}
+
+static void evict_merged_cache_entry(const void *key1, const void *key2) {
+    for (int i = 0; i < g_merged_count; i++) {
+        if (g_merged_cache[i].key1 == key1 && g_merged_cache[i].key2 == key2) {
+            g_merged_cache[i].buffer = nil;
+            g_merged_cache[i] = g_merged_cache[g_merged_count - 1];
+            g_merged_cache[g_merged_count - 1].buffer = nil;
+            g_merged_cache[g_merged_count - 1].key1 = NULL;
+            g_merged_cache[g_merged_count - 1].key2 = NULL;
+            g_merged_count--;
+            break;
+        }
+    }
+}
+
+/* Concatenate two Q8 weight matrices row-wise into a single GPU buffer. */
+static id<MTLBuffer> get_merged_q8_2(const int8_t *a_q8, size_t a_bytes,
+                                       const int8_t *b_q8, size_t b_bytes) {
+    for (int i = 0; i < g_q8_merged_count; i++) {
+        if (g_q8_merged_cache[i].key1 == a_q8 && g_q8_merged_cache[i].key2 == b_q8)
+            return g_q8_merged_cache[i].buffer;
+    }
+
+    size_t total = a_bytes + b_bytes;
+    id<MTLBuffer> merged = [g_device newBufferWithLength:total
+                                                 options:MTLResourceStorageModeShared];
+    if (!merged) return nil;
+    memcpy([merged contents], a_q8, a_bytes);
+    memcpy((uint8_t *)[merged contents] + a_bytes, b_q8, b_bytes);
+
+    if (g_q8_merged_count < MERGED_CACHE_SIZE) {
+        g_q8_merged_cache[g_q8_merged_count].key1 = a_q8;
+        g_q8_merged_cache[g_q8_merged_count].key2 = b_q8;
+        g_q8_merged_cache[g_q8_merged_count].buffer = merged;
+        g_q8_merged_count++;
+    }
+    return merged;
 }
 
 /* ========================================================================
@@ -298,6 +457,38 @@ static void clear_weight_cache(void) {
     }
     g_weight_cache_count = 0;
     pthread_mutex_unlock(&g_cache_mutex);
+}
+
+/* Concatenate two scale arrays into a single GPU buffer (reuses weight_cache). */
+static id<MTLBuffer> get_merged_scales_2(const float *a_scales, size_t a_rows,
+                                            const float *b_scales, size_t b_rows) {
+    size_t total = (a_rows + b_rows) * sizeof(float);
+    pthread_mutex_lock(&g_cache_mutex);
+    for (int i = 0; i < g_weight_cache_count; i++) {
+        if (g_weight_cache[i].cpu_ptr == a_scales && g_weight_cache[i].size == total) {
+            id<MTLBuffer> buf = g_weight_cache[i].gpu_buffer;
+            pthread_mutex_unlock(&g_cache_mutex);
+            return buf;
+        }
+    }
+    pthread_mutex_unlock(&g_cache_mutex);
+
+    float *merged = (float *)malloc(total);
+    if (!merged) return nil;
+    memcpy(merged, a_scales, a_rows * sizeof(float));
+    memcpy(merged + a_rows, b_scales, b_rows * sizeof(float));
+    id<MTLBuffer> buf = [g_device newBufferWithBytes:merged length:total
+                                             options:MTLResourceStorageModeShared];
+    free(merged);
+    if (buf && g_weight_cache_count < WEIGHT_CACHE_SIZE) {
+        pthread_mutex_lock(&g_cache_mutex);
+        g_weight_cache[g_weight_cache_count].cpu_ptr = a_scales;
+        g_weight_cache[g_weight_cache_count].gpu_buffer = buf;
+        g_weight_cache[g_weight_cache_count].size = total;
+        g_weight_cache_count++;
+        pthread_mutex_unlock(&g_cache_mutex);
+    }
+    return buf;
 }
 
 /* ========================================================================
@@ -539,6 +730,15 @@ static int init_shaders(void) {
         func = [g_shader_library newFunctionWithName:@"decoder_wo_residual"];
         if (func) g_decoder_wo_residual_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
 
+        func = [g_shader_library newFunctionWithName:@"decoder_ffn_gate_q8"];
+        if (func) g_decoder_ffn_gate_q8_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+
+        func = [g_shader_library newFunctionWithName:@"decoder_w2_residual_q8"];
+        if (func) g_decoder_w2_residual_q8_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+
+        func = [g_shader_library newFunctionWithName:@"decoder_wo_residual_q8"];
+        if (func) g_decoder_wo_residual_q8_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+
         g_shaders_initialized = 1;
 
         if (vox_verbose >= 2) {
@@ -599,6 +799,7 @@ void vox_metal_shutdown(void) {
 
     @autoreleasepool {
         clear_f16_cache();
+        clear_q8_cache();
         clear_merged_cache();
         clear_weight_cache();
         clear_activation_pool();
@@ -636,6 +837,9 @@ void vox_metal_shutdown(void) {
         g_decoder_ffn_gate_pipeline = nil;
         g_decoder_w2_residual_pipeline = nil;
         g_decoder_wo_residual_pipeline = nil;
+        g_decoder_ffn_gate_q8_pipeline = nil;
+        g_decoder_w2_residual_q8_pipeline = nil;
+        g_decoder_wo_residual_q8_pipeline = nil;
 
         /* Release shared allocs */
         for (int i = 0; i < g_shared_count; i++)
@@ -726,6 +930,55 @@ void vox_metal_sgemm_bf16(int M, int N, int K,
 
         memcpy(C, [bufferC contents], sizeC);
 
+        pool_release_buffer(bufferA);
+        pool_release_buffer(bufferC);
+    }
+}
+
+/* ========================================================================
+ * MPS Matrix Multiplication (Q8 weights → F16)
+ *
+ * C[M,N] = A[M,K] @ B_q8[N,K]^T   (Q8 dequantized to F16, then MPS matmul)
+ * ======================================================================== */
+
+void vox_metal_sgemm_q8(int M, int N, int K,
+                          const float *A,
+                          const int8_t *B_q8, const float *scales,
+                          float *C) {
+    if (!g_initialized) return;
+    id<MTLBuffer> bufferB = get_cached_q8_as_f16_buffer(B_q8, scales, N, K);
+    if (!bufferB) return;
+    @autoreleasepool {
+        size_t sizeA = (size_t)M * K * sizeof(float);
+        size_t sizeC = (size_t)M * N * sizeof(float);
+        id<MTLBuffer> bufferA = pool_get_buffer(sizeA);
+        if (bufferA) memcpy([bufferA contents], A, sizeA);
+        id<MTLBuffer> bufferC = pool_get_buffer(sizeC);
+        if (!bufferA || !bufferC) {
+            if (bufferA) pool_release_buffer(bufferA);
+            if (bufferC) pool_release_buffer(bufferC);
+            return;
+        }
+        MPSMatrixDescriptor *descA = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:M columns:K rowBytes:K * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor *descB = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:N columns:K rowBytes:K * sizeof(uint16_t)
+                            dataType:MPSDataTypeFloat16];
+        MPSMatrixDescriptor *descC = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:M columns:N rowBytes:N * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrix *matrixA = [[MPSMatrix alloc] initWithBuffer:bufferA descriptor:descA];
+        MPSMatrix *matrixB = [[MPSMatrix alloc] initWithBuffer:bufferB descriptor:descB];
+        MPSMatrix *matrixC = [[MPSMatrix alloc] initWithBuffer:bufferC descriptor:descC];
+        MPSMatrixMultiplication *matmul = get_cached_matmul_op(NO, YES, M, N, K, 1.0, 0.0);
+        if (!matmul) { pool_release_buffer(bufferA); pool_release_buffer(bufferC); return; }
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+        [matmul encodeToCommandBuffer:cmdBuffer leftMatrix:matrixA
+                           rightMatrix:matrixB resultMatrix:matrixC];
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+        memcpy(C, [bufferC contents], sizeC);
         pool_release_buffer(bufferA);
         pool_release_buffer(bufferC);
     }
@@ -1645,20 +1898,49 @@ static void encode_wo_ffn_steps(id<MTLCommandBuffer> cmdBuffer,
                                   const float *ada_scale,
                                   const uint16_t *w1_bf16,
                                   const uint16_t *w3_bf16,
-                                  const uint16_t *w2_bf16) {
+                                  const uint16_t *w2_bf16,
+                                  const int8_t *wo_q8, const float *wo_scales,
+                                  const int8_t *w1_q8, const float *w1_scales,
+                                  const int8_t *w3_q8, const float *w3_scales,
+                                  const int8_t *w2_q8, const float *w2_scales) {
     int M = 1;
+    int use_q8 = (wo_q8 != NULL);
 
-    id<MTLBuffer> bufWo = get_cached_bf16_as_f16_buffer(wo_bf16, (size_t)dim * q_dim);
-    id<MTLBuffer> bufW1W3 = get_merged_f16_2(w1_bf16, (size_t)hidden * dim,
-                                               w3_bf16, (size_t)hidden * dim);
-    id<MTLBuffer> bufW2 = get_cached_bf16_as_f16_buffer(w2_bf16, (size_t)dim * hidden);
+    id<MTLBuffer> bufWo = nil, bufW1W3 = nil, bufW2 = nil;
+    if (use_q8) {
+        /* Only create F16 fallback buffers when fused Q8 kernels are unavailable */
+        if (!g_decoder_wo_residual_q8_pipeline)
+            bufWo = get_cached_q8_as_f16_buffer(wo_q8, wo_scales, dim, q_dim);
+        if (!g_decoder_w2_residual_q8_pipeline)
+            bufW2 = get_cached_q8_as_f16_buffer(w2_q8, w2_scales, dim, hidden);
+    } else {
+        bufWo = get_cached_bf16_as_f16_buffer(wo_bf16, (size_t)dim * q_dim);
+        bufW1W3 = get_merged_f16_2(w1_bf16, (size_t)hidden * dim,
+                                     w3_bf16, (size_t)hidden * dim);
+        bufW2 = get_cached_bf16_as_f16_buffer(w2_bf16, (size_t)dim * hidden);
+    }
     id<MTLBuffer> bufNorm = get_cached_weight_buffer(ffn_norm, dim * sizeof(float));
     id<MTLBuffer> bufAda = ada_scale ?
         get_cached_weight_buffer(ada_scale, dim * sizeof(float)) : nil;
     int fused_wo_residual = 0;
 
     /* Step 1: proj = attn_out @ wo^T (or fused x += attn_out @ wo^T) */
-    if (g_decoder_wo_residual_pipeline) {
+    if (use_q8 && g_decoder_wo_residual_q8_pipeline) {
+        id<MTLBuffer> bufWoQ8 = get_cached_q8_buffer(wo_q8, (size_t)dim * q_dim);
+        id<MTLBuffer> bufWoScales = get_cached_weight_buffer(wo_scales, dim * sizeof(float));
+        id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+        [enc setComputePipelineState:g_decoder_wo_residual_q8_pipeline];
+        [enc setBuffer:g_dec_x offset:0 atIndex:0];
+        [enc setBuffer:bufAttn offset:0 atIndex:1];
+        [enc setBuffer:bufWoQ8 offset:0 atIndex:2];
+        [enc setBuffer:bufWoScales offset:0 atIndex:3];
+        [enc setBytes:&q_dim length:sizeof(int) atIndex:4];
+        [enc setBytes:&dim length:sizeof(int) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)dim, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        fused_wo_residual = 1;
+    } else if (g_decoder_wo_residual_pipeline) {
         id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
         [enc setComputePipelineState:g_decoder_wo_residual_pipeline];
         [enc setBuffer:g_dec_x offset:0 atIndex:0];
@@ -1737,7 +2019,35 @@ static void encode_wo_ffn_steps(id<MTLCommandBuffer> cmdBuffer,
     }
 
     /* Step 5+6+7+8: FFN gate in one kernel (fallback to old path if unavailable). */
-    if (g_decoder_ffn_gate_pipeline) {
+    if (use_q8 && g_decoder_ffn_gate_q8_pipeline) {
+        id<MTLBuffer> bufW1W3Q8 = get_merged_q8_2(w1_q8, (size_t)hidden * dim,
+                                                     w3_q8, (size_t)hidden * dim);
+        id<MTLBuffer> bufScales = get_merged_scales_2(w1_scales, (size_t)hidden,
+                                                         w3_scales, (size_t)hidden);
+        id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+        [enc setComputePipelineState:g_decoder_ffn_gate_q8_pipeline];
+        [enc setBuffer:bufXnorm offset:0 atIndex:0];
+        [enc setBuffer:bufW1W3Q8 offset:0 atIndex:1];
+        [enc setBuffer:bufScales offset:0 atIndex:2];
+        [enc setBuffer:bufGate offset:0 atIndex:3];
+        [enc setBytes:&dim length:sizeof(int) atIndex:4];
+        [enc setBytes:&hidden length:sizeof(int) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)hidden, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    } else if (g_decoder_ffn_gate_pipeline) {
+        if (use_q8 && !bufW1W3) {
+            /* Q8 path without Q8 fused kernel: build F16 merged buffer */
+            id<MTLBuffer> bufW1F16 = get_cached_q8_as_f16_buffer(w1_q8, w1_scales, hidden, dim);
+            id<MTLBuffer> bufW3F16 = get_cached_q8_as_f16_buffer(w3_q8, w3_scales, hidden, dim);
+            size_t total = (size_t)(hidden + hidden) * dim * sizeof(uint16_t);
+            bufW1W3 = [g_device newBufferWithLength:total options:MTLResourceStorageModeShared];
+            if (bufW1W3 && bufW1F16 && bufW3F16) {
+                memcpy([bufW1W3 contents], [bufW1F16 contents], (size_t)hidden * dim * sizeof(uint16_t));
+                memcpy((uint8_t *)[bufW1W3 contents] + (size_t)hidden * dim * sizeof(uint16_t),
+                       [bufW3F16 contents], (size_t)hidden * dim * sizeof(uint16_t));
+            }
+        }
         id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
         [enc setComputePipelineState:g_decoder_ffn_gate_pipeline];
         [enc setBuffer:bufXnorm offset:0 atIndex:0];
@@ -1749,6 +2059,17 @@ static void encode_wo_ffn_steps(id<MTLCommandBuffer> cmdBuffer,
            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [enc endEncoding];
     } else {
+        if (use_q8 && !bufW1W3) {
+            id<MTLBuffer> bufW1F16 = get_cached_q8_as_f16_buffer(w1_q8, w1_scales, hidden, dim);
+            id<MTLBuffer> bufW3F16 = get_cached_q8_as_f16_buffer(w3_q8, w3_scales, hidden, dim);
+            size_t total = (size_t)(hidden + hidden) * dim * sizeof(uint16_t);
+            bufW1W3 = [g_device newBufferWithLength:total options:MTLResourceStorageModeShared];
+            if (bufW1W3 && bufW1F16 && bufW3F16) {
+                memcpy([bufW1W3 contents], [bufW1F16 contents], (size_t)hidden * dim * sizeof(uint16_t));
+                memcpy((uint8_t *)[bufW1W3 contents] + (size_t)hidden * dim * sizeof(uint16_t),
+                       [bufW3F16 contents], (size_t)hidden * dim * sizeof(uint16_t));
+            }
+        }
         /* Step 5+6: [gate; up] = x_norm @ [w1; w3]^T (merged matmul) */
         {
             int hidden2 = hidden * 2;
@@ -1803,7 +2124,21 @@ static void encode_wo_ffn_steps(id<MTLCommandBuffer> cmdBuffer,
     }
 
     /* Step 9+10: W2 matmul + residual add (fallback to old path if unavailable). */
-    if (g_decoder_w2_residual_pipeline) {
+    if (use_q8 && g_decoder_w2_residual_q8_pipeline) {
+        id<MTLBuffer> bufW2Q8 = get_cached_q8_buffer(w2_q8, (size_t)dim * hidden);
+        id<MTLBuffer> bufW2Scales = get_cached_weight_buffer(w2_scales, dim * sizeof(float));
+        id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+        [enc setComputePipelineState:g_decoder_w2_residual_q8_pipeline];
+        [enc setBuffer:g_dec_x offset:0 atIndex:0];
+        [enc setBuffer:bufGate offset:0 atIndex:1];
+        [enc setBuffer:bufW2Q8 offset:0 atIndex:2];
+        [enc setBuffer:bufW2Scales offset:0 atIndex:3];
+        [enc setBytes:&hidden length:sizeof(int) atIndex:4];
+        [enc setBytes:&dim length:sizeof(int) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)dim, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    } else if (g_decoder_w2_residual_pipeline) {
         id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
         [enc setComputePipelineState:g_decoder_w2_residual_pipeline];
         [enc setBuffer:g_dec_x offset:0 atIndex:0];
@@ -1855,7 +2190,8 @@ static void encode_wo_ffn_steps(id<MTLCommandBuffer> cmdBuffer,
 }
 
 /* Helper: encode rms_norm + QKV matmuls from g_dec_x into a command buffer.
- * Appends to an already-open command buffer. */
+ * Appends to an already-open command buffer.
+ * Q8 params (wq_q8 etc.) are NULL when using BF16 weights. */
 static void encode_norm_qkv_steps(id<MTLCommandBuffer> cmdBuffer,
                                     id<MTLBuffer> bufXnorm,
                                     id<MTLBuffer> bufQKV, /* merged output: Q,K,V contiguous */
@@ -1863,13 +2199,49 @@ static void encode_norm_qkv_steps(id<MTLCommandBuffer> cmdBuffer,
                                     const float *norm_weight, float eps,
                                     const uint16_t *wq_bf16, int Nq,
                                     const uint16_t *wk_bf16, int Nk,
-                                    const uint16_t *wv_bf16, int Nv) {
+                                    const uint16_t *wv_bf16, int Nv,
+                                    const int8_t *wq_q8, const float *wq_scales,
+                                    const int8_t *wk_q8, const float *wk_scales,
+                                    const int8_t *wv_q8, const float *wv_scales) {
     int M = 1;
     int Nqkv = Nq + Nk + Nv;
 
-    id<MTLBuffer> bufWqkv = get_merged_f16_3(wq_bf16, (size_t)Nq * K,
-                                               wk_bf16, (size_t)Nk * K,
-                                               wv_bf16, (size_t)Nv * K);
+    id<MTLBuffer> bufWqkv;
+    if (wq_q8) {
+        /* Q8 path: check merged cache first (keyed by wq_q8, wk_q8) */
+        for (int i = 0; i < g_merged_count; i++) {
+            if (g_merged_cache[i].key1 == wq_q8 && g_merged_cache[i].key2 == wk_q8) {
+                bufWqkv = g_merged_cache[i].buffer;
+                goto have_qkv;
+            }
+        }
+        /* Build merged F16 QKV from Q8 */
+        {
+            id<MTLBuffer> buf_q = get_cached_q8_as_f16_buffer(wq_q8, wq_scales, Nq, K);
+            id<MTLBuffer> buf_k = get_cached_q8_as_f16_buffer(wk_q8, wk_scales, Nk, K);
+            id<MTLBuffer> buf_v = get_cached_q8_as_f16_buffer(wv_q8, wv_scales, Nv, K);
+            size_t total = ((size_t)Nq + Nk + Nv) * K * sizeof(uint16_t);
+            bufWqkv = [g_device newBufferWithLength:total options:MTLResourceStorageModeShared];
+            if (bufWqkv && buf_q && buf_k && buf_v) {
+                memcpy([bufWqkv contents], [buf_q contents], (size_t)Nq * K * sizeof(uint16_t));
+                memcpy((uint8_t *)[bufWqkv contents] + (size_t)Nq * K * sizeof(uint16_t),
+                       [buf_k contents], (size_t)Nk * K * sizeof(uint16_t));
+                memcpy((uint8_t *)[bufWqkv contents] + (size_t)(Nq + Nk) * K * sizeof(uint16_t),
+                       [buf_v contents], (size_t)Nv * K * sizeof(uint16_t));
+            }
+            if (bufWqkv && g_merged_count < MERGED_CACHE_SIZE) {
+                g_merged_cache[g_merged_count].key1 = wq_q8;
+                g_merged_cache[g_merged_count].key2 = wk_q8;
+                g_merged_cache[g_merged_count].buffer = bufWqkv;
+                g_merged_count++;
+            }
+        }
+        have_qkv:;
+    } else {
+        bufWqkv = get_merged_f16_3(wq_bf16, (size_t)Nq * K,
+                                     wk_bf16, (size_t)Nk * K,
+                                     wv_bf16, (size_t)Nv * K);
+    }
     id<MTLBuffer> bufNorm = get_cached_weight_buffer(norm_weight, K * sizeof(float));
 
     /* rms_norm(g_dec_x, norm_weight) → bufXnorm */
@@ -1937,7 +2309,8 @@ void vox_metal_decoder_norm_qkv(int K,
         id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
         encode_norm_qkv_steps(cmdBuffer, bufXnorm, bufQKV,
                               K, norm_weight, eps,
-                              wq_bf16, Nq, wk_bf16, Nk, wv_bf16, Nv);
+                              wq_bf16, Nq, wk_bf16, Nk, wv_bf16, Nv,
+                              NULL, NULL, NULL, NULL, NULL, NULL);
 
         [cmdBuffer commit];
         [cmdBuffer waitUntilCompleted];
@@ -2000,14 +2373,17 @@ void vox_metal_decoder_wo_ffn_next_qkv(int dim, int q_dim, int hidden,
                             bufGate, bufFfnOut,
                             dim, q_dim, hidden,
                             wo_bf16, ffn_norm, eps, ada_scale,
-                            w1_bf16, w3_bf16, w2_bf16);
+                            w1_bf16, w3_bf16, w2_bf16,
+                            NULL, NULL, NULL, NULL,
+                            NULL, NULL, NULL, NULL);
 
         /* Steps 11-14: norm + QKV for next layer (merged matmul) */
         encode_norm_qkv_steps(cmdBuffer, bufXnorm, bufQKV,
                               dim, next_attn_norm, eps,
                               next_wq_bf16, next_Nq,
                               next_wk_bf16, next_Nk,
-                              next_wv_bf16, next_Nv);
+                              next_wv_bf16, next_Nv,
+                              NULL, NULL, NULL, NULL, NULL, NULL);
 
         [cmdBuffer commit];
         [cmdBuffer waitUntilCompleted];
@@ -2080,7 +2456,9 @@ int vox_metal_decoder_wo_ffn_logits(int dim, int q_dim, int hidden, int vocab_si
                             bufGate, bufFfnOut,
                             dim, q_dim, hidden,
                             wo_bf16, ffn_norm, eps, ada_scale,
-                            w1_bf16, w3_bf16, w2_bf16);
+                            w1_bf16, w3_bf16, w2_bf16,
+                            NULL, NULL, NULL, NULL,
+                            NULL, NULL, NULL, NULL);
 
         /* Step 11: final rms_norm(g_dec_x, final_norm) → bufXnorm */
         {
@@ -2518,7 +2896,11 @@ int vox_metal_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *l
                                     prev->wo_weight_bf16,
                                     prev->ffn_norm, VOX_DEC_NORM_EPS, ada_s,
                                     prev->w1_weight_bf16, prev->w3_weight_bf16,
-                                    prev->w2_weight_bf16);
+                                    prev->w2_weight_bf16,
+                                    prev->wo_weight_q8, prev->wo_scale_q8,
+                                    prev->w1_weight_q8, prev->w1_scale_q8,
+                                    prev->w3_weight_q8, prev->w3_scale_q8,
+                                    prev->w2_weight_q8, prev->w2_scale_q8);
             }
 
             /* RMSNorm + QKV projections (merged into single matmul) */
@@ -2526,7 +2908,10 @@ int vox_metal_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *l
                                   dim, l->attention_norm, VOX_DEC_NORM_EPS,
                                   l->wq_weight_bf16, q_dim,
                                   l->wk_weight_bf16, kv_dim,
-                                  l->wv_weight_bf16, kv_dim);
+                                  l->wv_weight_bf16, kv_dim,
+                                  l->wq_weight_q8, l->wq_scale_q8,
+                                  l->wk_weight_q8, l->wk_scale_q8,
+                                  l->wv_weight_q8, l->wv_scale_q8);
 
             /* RoPE + KV cache write + attention in single compute encoder.
              * bufQKV layout: [Q (q_dim), K (kv_dim), V (kv_dim)] */
@@ -2628,7 +3013,11 @@ int vox_metal_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *l
                                 last->wo_weight_bf16,
                                 last->ffn_norm, VOX_DEC_NORM_EPS, ada_s,
                                 last->w1_weight_bf16, last->w3_weight_bf16,
-                                last->w2_weight_bf16);
+                                last->w2_weight_bf16,
+                                last->wo_weight_q8, last->wo_scale_q8,
+                                last->w1_weight_q8, last->w1_scale_q8,
+                                last->w3_weight_q8, last->w3_scale_q8,
+                                last->w2_weight_q8, last->w2_scale_q8);
 
             /* Final RMSNorm */
             id<MTLBuffer> bufFinalNorm = get_cached_weight_buffer(dec->norm,
@@ -2648,8 +3037,11 @@ int vox_metal_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *l
             }
 
             /* Logits = x_norm @ tok_emb^T */
-            id<MTLBuffer> bufEmb = get_cached_bf16_as_f16_buffer(
-                dec->tok_embeddings_bf16, (size_t)VOX_VOCAB_SIZE * dim);
+            id<MTLBuffer> bufEmb = dec->tok_embeddings_q8 ?
+                get_cached_q8_as_f16_buffer(dec->tok_embeddings_q8,
+                    dec->tok_embeddings_scale_q8, VOX_VOCAB_SIZE, dim) :
+                get_cached_bf16_as_f16_buffer(
+                    dec->tok_embeddings_bf16, (size_t)VOX_VOCAB_SIZE * dim);
             {
                 int vocab = VOX_VOCAB_SIZE;
                 MPSMatrixDescriptor *descIn = [MPSMatrixDescriptor
@@ -2801,10 +3193,42 @@ int vox_metal_encoder_full_step(void *ctx_ptr, float *x, int new_len,
 
             /* Step 2: Merged QKV projection (packed layout in bufQKV) */
             {
-                id<MTLBuffer> bufWqkv = get_merged_f16_3(
-                    l->wq_weight_bf16, (size_t)qkv_dim * dim,
-                    l->wk_weight_bf16, (size_t)kv_dim * dim,
-                    l->wv_weight_bf16, (size_t)kv_dim * dim);
+                id<MTLBuffer> bufWqkv;
+                if (l->wq_weight_q8) {
+                    bufWqkv = nil;
+                    for (int ci = 0; ci < g_merged_count; ci++) {
+                        if (g_merged_cache[ci].key1 == l->wq_weight_q8 &&
+                            g_merged_cache[ci].key2 == l->wk_weight_q8) {
+                            bufWqkv = g_merged_cache[ci].buffer;
+                            break;
+                        }
+                    }
+                    if (!bufWqkv) {
+                        id<MTLBuffer> bq = get_cached_q8_as_f16_buffer(l->wq_weight_q8, l->wq_scale_q8, qkv_dim, dim);
+                        id<MTLBuffer> bk = get_cached_q8_as_f16_buffer(l->wk_weight_q8, l->wk_scale_q8, kv_dim, dim);
+                        id<MTLBuffer> bv = get_cached_q8_as_f16_buffer(l->wv_weight_q8, l->wv_scale_q8, kv_dim, dim);
+                        size_t total = ((size_t)qkv_dim + kv_dim + kv_dim) * dim * sizeof(uint16_t);
+                        bufWqkv = [g_device newBufferWithLength:total options:MTLResourceStorageModeShared];
+                        if (bufWqkv && bq && bk && bv) {
+                            memcpy([bufWqkv contents], [bq contents], (size_t)qkv_dim * dim * sizeof(uint16_t));
+                            memcpy((uint8_t *)[bufWqkv contents] + (size_t)qkv_dim * dim * sizeof(uint16_t),
+                                   [bk contents], (size_t)kv_dim * dim * sizeof(uint16_t));
+                            memcpy((uint8_t *)[bufWqkv contents] + (size_t)(qkv_dim + kv_dim) * dim * sizeof(uint16_t),
+                                   [bv contents], (size_t)kv_dim * dim * sizeof(uint16_t));
+                        }
+                        if (bufWqkv && g_merged_count < MERGED_CACHE_SIZE) {
+                            g_merged_cache[g_merged_count].key1 = l->wq_weight_q8;
+                            g_merged_cache[g_merged_count].key2 = l->wk_weight_q8;
+                            g_merged_cache[g_merged_count].buffer = bufWqkv;
+                            g_merged_count++;
+                        }
+                    }
+                } else {
+                    bufWqkv = get_merged_f16_3(
+                        l->wq_weight_bf16, (size_t)qkv_dim * dim,
+                        l->wk_weight_bf16, (size_t)kv_dim * dim,
+                        l->wv_weight_bf16, (size_t)kv_dim * dim);
+                }
 
                 MPSMatrixDescriptor *descIn = [MPSMatrixDescriptor
                     matrixDescriptorWithRows:M columns:dim
@@ -2962,8 +3386,9 @@ int vox_metal_encoder_full_step(void *ctx_ptr, float *x, int new_len,
 
             /* Step 4: wo projection */
             {
-                id<MTLBuffer> bufWo = get_cached_bf16_as_f16_buffer(l->wo_weight_bf16,
-                                            (size_t)dim * qkv_dim);
+                id<MTLBuffer> bufWo = l->wo_weight_q8 ?
+                    get_cached_q8_as_f16_buffer(l->wo_weight_q8, l->wo_scale_q8, dim, qkv_dim) :
+                    get_cached_bf16_as_f16_buffer(l->wo_weight_bf16, (size_t)dim * qkv_dim);
                 MPSMatrixDescriptor *descA = [MPSMatrixDescriptor
                     matrixDescriptorWithRows:M columns:qkv_dim
                                     rowBytes:qkv_dim * sizeof(float)
@@ -3041,11 +3466,43 @@ int vox_metal_encoder_full_step(void *ctx_ptr, float *x, int new_len,
 
             /* Step 6: Merged FFN (1 matmul for w1+w3, fused silu*mul, strided w2) */
             {
-                id<MTLBuffer> bufW1W3 = get_merged_f16_2(
-                    l->w1_weight_bf16, (size_t)hidden * dim,
-                    l->w3_weight_bf16, (size_t)hidden * dim);
-                id<MTLBuffer> bufW2 = get_cached_bf16_as_f16_buffer(l->w2_weight_bf16,
-                                            (size_t)dim * hidden);
+                id<MTLBuffer> bufW1W3, bufW2;
+                if (l->w1_weight_q8) {
+                    bufW1W3 = nil;
+                    for (int ci = 0; ci < g_merged_count; ci++) {
+                        if (g_merged_cache[ci].key1 == l->w1_weight_q8 &&
+                            g_merged_cache[ci].key2 == l->w3_weight_q8) {
+                            bufW1W3 = g_merged_cache[ci].buffer;
+                            break;
+                        }
+                    }
+                    if (!bufW1W3) {
+                        id<MTLBuffer> bw1 = get_cached_q8_as_f16_buffer(l->w1_weight_q8, l->w1_scale_q8, hidden, dim);
+                        id<MTLBuffer> bw3 = get_cached_q8_as_f16_buffer(l->w3_weight_q8, l->w3_scale_q8, hidden, dim);
+                        if (bw1 && bw3) {
+                            size_t total = (size_t)(hidden + hidden) * dim * sizeof(uint16_t);
+                            bufW1W3 = [g_device newBufferWithLength:total options:MTLResourceStorageModeShared];
+                            if (bufW1W3) {
+                                memcpy([bufW1W3 contents], [bw1 contents], (size_t)hidden * dim * sizeof(uint16_t));
+                                memcpy((uint8_t *)[bufW1W3 contents] + (size_t)hidden * dim * sizeof(uint16_t),
+                                       [bw3 contents], (size_t)hidden * dim * sizeof(uint16_t));
+                            }
+                            if (bufW1W3 && g_merged_count < MERGED_CACHE_SIZE) {
+                                g_merged_cache[g_merged_count].key1 = l->w1_weight_q8;
+                                g_merged_cache[g_merged_count].key2 = l->w3_weight_q8;
+                                g_merged_cache[g_merged_count].buffer = bufW1W3;
+                                g_merged_count++;
+                            }
+                        }
+                    }
+                    bufW2 = get_cached_q8_as_f16_buffer(l->w2_weight_q8, l->w2_scale_q8, dim, hidden);
+                } else {
+                    bufW1W3 = get_merged_f16_2(
+                        l->w1_weight_bf16, (size_t)hidden * dim,
+                        l->w3_weight_bf16, (size_t)hidden * dim);
+                    bufW2 = get_cached_bf16_as_f16_buffer(l->w2_weight_bf16,
+                                                (size_t)dim * hidden);
+                }
                 id<MTLBuffer> bufW2Bias = get_cached_weight_buffer(l->w2_bias,
                                             dim * sizeof(float));
 
@@ -3192,6 +3649,25 @@ int vox_metal_encoder_full_step(void *ctx_ptr, float *x, int new_len,
         pool_release_buffer(bufGate);
         pool_release_buffer(bufFfnOut);
         pool_release_buffer(bufRope);
+
+        /* Evict individual encoder F16 caches where merged buffers exist.
+         * The merged QKV and W1+W3 buffers in g_merged_cache suffice for
+         * subsequent encoder calls (streaming). wo and w2 stay (no merged). */
+        if (enc->layers[0].wq_weight_q8) {
+            int before = g_f16_cache_count;
+            for (int layer = 0; layer < VOX_ENC_LAYERS; layer++) {
+                vox_enc_layer_t *l = &enc->layers[layer];
+                evict_f16_cache_entry(l->wq_weight_q8);
+                evict_f16_cache_entry(l->wk_weight_q8);
+                evict_f16_cache_entry(l->wv_weight_q8);
+                evict_f16_cache_entry(l->w1_weight_q8);
+                evict_f16_cache_entry(l->w3_weight_q8);
+            }
+            int freed = before - g_f16_cache_count;
+            if (freed > 0)
+                fprintf(stderr, "[Q8] Evicted %d encoder F16 caches "
+                        "(f16_cache: %d entries remain)\n", freed, g_f16_cache_count);
+        }
     }
 
     return 0;
@@ -3293,10 +3769,43 @@ void vox_metal_decoder_prefill_step(void *ctx_ptr, float *x, int seq_len,
 
             /* Step 2: Merged QKV projection (packed layout in bufQKV) */
             {
-                id<MTLBuffer> bufWqkv = get_merged_f16_3(
-                    l->wq_weight_bf16, (size_t)q_dim * dim,
-                    l->wk_weight_bf16, (size_t)kv_dim * dim,
-                    l->wv_weight_bf16, (size_t)kv_dim * dim);
+                id<MTLBuffer> bufWqkv;
+                if (l->wq_weight_q8) {
+                    /* Q8: check merged cache, or build from Q8→F16 */
+                    bufWqkv = nil;
+                    for (int ci = 0; ci < g_merged_count; ci++) {
+                        if (g_merged_cache[ci].key1 == l->wq_weight_q8 &&
+                            g_merged_cache[ci].key2 == l->wk_weight_q8) {
+                            bufWqkv = g_merged_cache[ci].buffer;
+                            break;
+                        }
+                    }
+                    if (!bufWqkv) {
+                        id<MTLBuffer> bq = get_cached_q8_as_f16_buffer(l->wq_weight_q8, l->wq_scale_q8, q_dim, dim);
+                        id<MTLBuffer> bk = get_cached_q8_as_f16_buffer(l->wk_weight_q8, l->wk_scale_q8, kv_dim, dim);
+                        id<MTLBuffer> bv = get_cached_q8_as_f16_buffer(l->wv_weight_q8, l->wv_scale_q8, kv_dim, dim);
+                        size_t total = ((size_t)q_dim + kv_dim + kv_dim) * dim * sizeof(uint16_t);
+                        bufWqkv = [g_device newBufferWithLength:total options:MTLResourceStorageModeShared];
+                        if (bufWqkv && bq && bk && bv) {
+                            memcpy([bufWqkv contents], [bq contents], (size_t)q_dim * dim * sizeof(uint16_t));
+                            memcpy((uint8_t *)[bufWqkv contents] + (size_t)q_dim * dim * sizeof(uint16_t),
+                                   [bk contents], (size_t)kv_dim * dim * sizeof(uint16_t));
+                            memcpy((uint8_t *)[bufWqkv contents] + (size_t)(q_dim + kv_dim) * dim * sizeof(uint16_t),
+                                   [bv contents], (size_t)kv_dim * dim * sizeof(uint16_t));
+                        }
+                        if (bufWqkv && g_merged_count < MERGED_CACHE_SIZE) {
+                            g_merged_cache[g_merged_count].key1 = l->wq_weight_q8;
+                            g_merged_cache[g_merged_count].key2 = l->wk_weight_q8;
+                            g_merged_cache[g_merged_count].buffer = bufWqkv;
+                            g_merged_count++;
+                        }
+                    }
+                } else {
+                    bufWqkv = get_merged_f16_3(
+                        l->wq_weight_bf16, (size_t)q_dim * dim,
+                        l->wk_weight_bf16, (size_t)kv_dim * dim,
+                        l->wv_weight_bf16, (size_t)kv_dim * dim);
+                }
 
                 MPSMatrixDescriptor *descIn = [MPSMatrixDescriptor
                     matrixDescriptorWithRows:M columns:dim
@@ -3422,8 +3931,9 @@ void vox_metal_decoder_prefill_step(void *ctx_ptr, float *x, int seq_len,
 
             /* Step 4: wo projection */
             {
-                id<MTLBuffer> bufWo = get_cached_bf16_as_f16_buffer(l->wo_weight_bf16,
-                                            (size_t)dim * q_dim);
+                id<MTLBuffer> bufWo = l->wo_weight_q8 ?
+                    get_cached_q8_as_f16_buffer(l->wo_weight_q8, l->wo_scale_q8, dim, q_dim) :
+                    get_cached_bf16_as_f16_buffer(l->wo_weight_bf16, (size_t)dim * q_dim);
                 MPSMatrixDescriptor *descA = [MPSMatrixDescriptor
                     matrixDescriptorWithRows:M columns:q_dim
                                     rowBytes:q_dim * sizeof(float)
@@ -3503,11 +4013,43 @@ void vox_metal_decoder_prefill_step(void *ctx_ptr, float *x, int seq_len,
 
             /* Step 6: Merged FFN (1 matmul for w1+w3, fused silu*mul, strided w2) */
             {
-                id<MTLBuffer> bufW1W3 = get_merged_f16_2(
-                    l->w1_weight_bf16, (size_t)hidden * dim,
-                    l->w3_weight_bf16, (size_t)hidden * dim);
-                id<MTLBuffer> bufW2 = get_cached_bf16_as_f16_buffer(l->w2_weight_bf16,
-                                            (size_t)dim * hidden);
+                id<MTLBuffer> bufW1W3, bufW2;
+                if (l->w1_weight_q8) {
+                    bufW1W3 = nil;
+                    for (int ci = 0; ci < g_merged_count; ci++) {
+                        if (g_merged_cache[ci].key1 == l->w1_weight_q8 &&
+                            g_merged_cache[ci].key2 == l->w3_weight_q8) {
+                            bufW1W3 = g_merged_cache[ci].buffer;
+                            break;
+                        }
+                    }
+                    if (!bufW1W3) {
+                        id<MTLBuffer> bw1 = get_cached_q8_as_f16_buffer(l->w1_weight_q8, l->w1_scale_q8, hidden, dim);
+                        id<MTLBuffer> bw3 = get_cached_q8_as_f16_buffer(l->w3_weight_q8, l->w3_scale_q8, hidden, dim);
+                        if (bw1 && bw3) {
+                            size_t total = (size_t)(hidden + hidden) * dim * sizeof(uint16_t);
+                            bufW1W3 = [g_device newBufferWithLength:total options:MTLResourceStorageModeShared];
+                            if (bufW1W3) {
+                                memcpy([bufW1W3 contents], [bw1 contents], (size_t)hidden * dim * sizeof(uint16_t));
+                                memcpy((uint8_t *)[bufW1W3 contents] + (size_t)hidden * dim * sizeof(uint16_t),
+                                       [bw3 contents], (size_t)hidden * dim * sizeof(uint16_t));
+                            }
+                            if (bufW1W3 && g_merged_count < MERGED_CACHE_SIZE) {
+                                g_merged_cache[g_merged_count].key1 = l->w1_weight_q8;
+                                g_merged_cache[g_merged_count].key2 = l->w3_weight_q8;
+                                g_merged_cache[g_merged_count].buffer = bufW1W3;
+                                g_merged_count++;
+                            }
+                        }
+                    }
+                    bufW2 = get_cached_q8_as_f16_buffer(l->w2_weight_q8, l->w2_scale_q8, dim, hidden);
+                } else {
+                    bufW1W3 = get_merged_f16_2(
+                        l->w1_weight_bf16, (size_t)hidden * dim,
+                        l->w3_weight_bf16, (size_t)hidden * dim);
+                    bufW2 = get_cached_bf16_as_f16_buffer(l->w2_weight_bf16,
+                                                (size_t)dim * hidden);
+                }
 
                 /* [gate; up] = x_norm @ [w1; w3]^T → bufGate [M, hidden*2] */
                 {
@@ -3607,6 +4149,31 @@ void vox_metal_decoder_prefill_step(void *ctx_ptr, float *x, int seq_len,
         pool_release_buffer(bufRope);
     }
 
+    /* Evict decoder F16 caches not needed for M=1 decode with fused Q8 kernels.
+     * FFN weights (wo, w1, w3, w2): fused Q8 kernels use int8 directly.
+     * QKV individual F16: merged QKV buffer (in g_merged_cache) suffices. */
+    if (g_decoder_ffn_gate_q8_pipeline && g_decoder_w2_residual_q8_pipeline &&
+        g_decoder_wo_residual_q8_pipeline) {
+        int before = g_f16_cache_count;
+        for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {
+            vox_dec_layer_t *l = &dec->layers[layer];
+            if (l->w1_weight_q8) {
+                evict_f16_cache_entry(l->wo_weight_q8);
+                evict_f16_cache_entry(l->w1_weight_q8);
+                evict_f16_cache_entry(l->w3_weight_q8);
+                evict_f16_cache_entry(l->w2_weight_q8);
+                evict_f16_cache_entry(l->wq_weight_q8);
+                evict_f16_cache_entry(l->wk_weight_q8);
+                evict_f16_cache_entry(l->wv_weight_q8);
+                evict_merged_cache_entry(l->w1_weight_q8, l->w3_weight_q8);
+            }
+        }
+        int freed = before - g_f16_cache_count;
+        if (freed > 0)
+            fprintf(stderr, "[Q8] Evicted %d decoder F16 caches "
+                    "(f16_cache: %d entries remain)\n", freed, g_f16_cache_count);
+    }
+
     /* Update KV cache length */
     ctx->kv_cache_len = start_pos + seq_len;
 }
@@ -3631,6 +4198,23 @@ void vox_metal_warmup_merged_3(const uint16_t *a, size_t a_n,
                                 const uint16_t *c, size_t c_n) {
     if (!g_initialized) return;
     (void)get_merged_f16_3(a, a_n, b, b_n, c, c_n);
+}
+
+void vox_metal_warmup_q8(const int8_t *q8_data, const float *scales,
+                           int rows, int cols) {
+    if (!g_initialized || !q8_data) return;
+    get_cached_q8_as_f16_buffer(q8_data, scales, rows, cols);
+    get_cached_q8_buffer(q8_data, (size_t)rows * cols);
+    get_cached_weight_buffer(scales, (size_t)rows * sizeof(float));
+}
+
+void vox_metal_warmup_merged_q8_2(const int8_t *a_q8, const float *a_scales, size_t a_rows, size_t a_cols,
+                                    const int8_t *b_q8, const float *b_scales, size_t b_rows, size_t b_cols) {
+    if (!g_initialized) return;
+    vox_metal_warmup_q8(a_q8, a_scales, (int)a_rows, (int)a_cols);
+    vox_metal_warmup_q8(b_q8, b_scales, (int)b_rows, (int)b_cols);
+    get_merged_q8_2(a_q8, a_rows * a_cols, b_q8, b_rows * b_cols);
+    get_merged_scales_2(a_scales, a_rows, b_scales, b_rows);
 }
 
 void vox_metal_warmup_decoder_ops(void *ctx_ptr) {
