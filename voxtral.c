@@ -192,6 +192,12 @@ vox_ctx_t *vox_load(const char *model_dir) {
         if (vox_verbose >= 2)
             fprintf(stderr, "Pre-warming Metal weight cache...\n");
 
+        /* Register mmap for native Q8 Metal kernels (zero-copy weight access) */
+        if (ctx->use_q8) {
+            safetensors_file_t *sf = (safetensors_file_t *)ctx->safetensors;
+            vox_metal_register_mmap(sf->data, sf->file_size);
+        }
+
         if (!ctx->use_q8) {
             /* Encoder weights: merged QKV + merged w1+w3 (replaces individual caching)
              * wo and w2 still cached individually. */

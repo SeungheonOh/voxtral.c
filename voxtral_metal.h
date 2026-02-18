@@ -274,6 +274,10 @@ void vox_metal_warmup_q8(const int8_t *q8_data, const float *scales,
 void vox_metal_warmup_merged_q8_2(const int8_t *a_q8, const float *a_scales, size_t a_rows, size_t a_cols,
                                     const int8_t *b_q8, const float *b_scales, size_t b_rows, size_t b_cols);
 
+/* Register the mmap'd safetensors file as a zero-copy Metal buffer.
+ * Enables native Q8 compute kernels to read weights directly from mmap. */
+void vox_metal_register_mmap(void *base, size_t size);
+
 /* GPU memory usage (for debugging). */
 size_t vox_metal_memory_used(void);
 

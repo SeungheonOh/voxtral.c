@@ -9,6 +9,7 @@
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #include "voxtral_metal.h"
+#include "voxtral_metal_internal.h"
 #include "voxtral_shaders_source.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,51 +23,101 @@ extern int vox_verbose;
  * Global Metal State
  * ======================================================================== */
 
-static id<MTLDevice> g_device = nil;
-static id<MTLCommandQueue> g_queue = nil;
+id<MTLDevice> g_device = nil;
+id<MTLCommandQueue> g_queue = nil;
 static int g_initialized = 0;
 
 /* Compute shader pipelines */
 static id<MTLLibrary> g_shader_library = nil;
-static id<MTLComputePipelineState> g_rms_norm_pipeline = nil;
-static id<MTLComputePipelineState> g_silu_pipeline = nil;
+id<MTLComputePipelineState> g_rms_norm_pipeline = nil;
+id<MTLComputePipelineState> g_silu_pipeline = nil;
 static id<MTLComputePipelineState> g_gelu_pipeline = nil;
-static id<MTLComputePipelineState> g_add_inplace_pipeline = nil;
-static id<MTLComputePipelineState> g_mul_inplace_pipeline = nil;
+id<MTLComputePipelineState> g_add_inplace_pipeline = nil;
+id<MTLComputePipelineState> g_mul_inplace_pipeline = nil;
 static id<MTLComputePipelineState> g_causal_softmax_pipeline = nil;
-static id<MTLComputePipelineState> g_ada_scale_mul_pipeline = nil;
-static id<MTLComputePipelineState> g_argmax_pipeline = nil;
+id<MTLComputePipelineState> g_ada_scale_mul_pipeline = nil;
+id<MTLComputePipelineState> g_argmax_pipeline = nil;
 static int g_shaders_initialized = 0;
 
 /* Persistent GPU x buffer for cross-layer decoder fusion */
-static id<MTLBuffer> g_dec_x = nil;
+id<MTLBuffer> g_dec_x = nil;
 
 /* New kernels for monolithic decoder step */
-static id<MTLComputePipelineState> g_rope_apply_pipeline = nil;
-static id<MTLComputePipelineState> g_kv_cache_copy_pipeline = nil;
-static id<MTLComputePipelineState> g_kv_cache_copy_f16_pipeline = nil;
-static id<MTLComputePipelineState> g_decoder_attention_pipeline = nil;
-static id<MTLComputePipelineState> g_decoder_attention_f16_pipeline = nil;
+id<MTLComputePipelineState> g_rope_apply_pipeline = nil;
+id<MTLComputePipelineState> g_kv_cache_copy_pipeline = nil;
+id<MTLComputePipelineState> g_kv_cache_copy_f16_pipeline = nil;
+id<MTLComputePipelineState> g_decoder_attention_pipeline = nil;
+id<MTLComputePipelineState> g_decoder_attention_f16_pipeline = nil;
 static id<MTLComputePipelineState> g_encoder_attention_pipeline = nil;
 static id<MTLComputePipelineState> g_encoder_attention_kv_f16_pipeline = nil;
-static id<MTLComputePipelineState> g_bias_add_pipeline = nil;
-static id<MTLComputePipelineState> g_bias_add_strided_pipeline = nil;
+id<MTLComputePipelineState> g_bias_add_pipeline = nil;
+id<MTLComputePipelineState> g_bias_add_strided_pipeline = nil;
 static id<MTLComputePipelineState> g_batched_rope_apply_pipeline = nil;
-static id<MTLComputePipelineState> g_batched_rope_apply_strided_pipeline = nil;
+id<MTLComputePipelineState> g_batched_rope_apply_strided_pipeline = nil;
 static id<MTLComputePipelineState> g_batched_kv_cache_copy_pipeline = nil;
 static id<MTLComputePipelineState> g_batched_kv_cache_copy_f16_pipeline = nil;
-static id<MTLComputePipelineState> g_batched_kv_cache_copy_strided_pipeline = nil;
-static id<MTLComputePipelineState> g_batched_kv_cache_copy_strided_f16_pipeline = nil;
-static id<MTLComputePipelineState> g_encoder_attention_qstrided_pipeline = nil;
-static id<MTLComputePipelineState> g_encoder_attention_kv_f16_qstrided_pipeline = nil;
+id<MTLComputePipelineState> g_batched_kv_cache_copy_strided_pipeline = nil;
+id<MTLComputePipelineState> g_batched_kv_cache_copy_strided_f16_pipeline = nil;
+id<MTLComputePipelineState> g_encoder_attention_qstrided_pipeline = nil;
+id<MTLComputePipelineState> g_encoder_attention_kv_f16_qstrided_pipeline = nil;
 static id<MTLComputePipelineState> g_deinterleave_pipeline = nil;
-static id<MTLComputePipelineState> g_silu_mul_merged_pipeline = nil;
+id<MTLComputePipelineState> g_silu_mul_merged_pipeline = nil;
 static id<MTLComputePipelineState> g_decoder_ffn_gate_pipeline = nil;
 static id<MTLComputePipelineState> g_decoder_w2_residual_pipeline = nil;
 static id<MTLComputePipelineState> g_decoder_wo_residual_pipeline = nil;
-static id<MTLComputePipelineState> g_decoder_ffn_gate_q8_pipeline = nil;
-static id<MTLComputePipelineState> g_decoder_w2_residual_q8_pipeline = nil;
-static id<MTLComputePipelineState> g_decoder_wo_residual_q8_pipeline = nil;
+id<MTLComputePipelineState> g_decoder_ffn_gate_q8_pipeline = nil;
+id<MTLComputePipelineState> g_decoder_w2_residual_q8_pipeline = nil;
+id<MTLComputePipelineState> g_decoder_wo_residual_q8_pipeline = nil;
+
+/* Q8 native matmul pipelines */
+id<MTLComputePipelineState> g_matmul_q8_pipeline = nil;
+id<MTLComputePipelineState> g_matmul_q8_residual_pipeline = nil;
+id<MTLComputePipelineState> g_matmul_q8_tiled_pipeline = nil;
+id<MTLComputePipelineState> g_matmul_q8_tiled_residual_pipeline = nil;
+
+/* Zero-copy mmap Metal buffer */
+id<MTLBuffer> g_mmap_buffer = nil;
+void *g_mmap_base = NULL;
+
+void vox_metal_register_mmap(void *base, size_t size) {
+    if (!g_initialized || !base || !size) return;
+    size_t page = getpagesize();
+    size_t aligned = (size + page - 1) & ~(page - 1);
+
+    const char *preload_env = getenv("VOX_Q8_PRELOAD");
+    int preload = (preload_env && atoi(preload_env) != 0);
+
+    if (!preload) {
+        g_mmap_buffer = [g_device newBufferWithBytesNoCopy:base
+                                                    length:aligned
+                                                   options:MTLResourceStorageModeShared
+                                               deallocator:nil];
+    }
+
+    g_mmap_base = base;
+
+    if (!g_mmap_buffer) {
+        if (preload) {
+            if (vox_verbose >= 1)
+                fprintf(stderr, "Metal: preloading Q8 weights into GPU buffer (%zu MB)\n",
+                        aligned / (1024 * 1024));
+        } else {
+            fprintf(stderr, "Metal: FAILED newBufferWithBytesNoCopy, falling back to copy\n");
+        }
+        g_mmap_buffer = [g_device newBufferWithLength:aligned
+                                              options:MTLResourceStorageModeShared];
+        if (!g_mmap_buffer) return;
+        memcpy([g_mmap_buffer contents], base, size);
+    } else {
+        if (vox_verbose >= 1)
+            fprintf(stderr, "Metal: registered zero-copy Q8 GPU buffer (%zu MB)\n",
+                    aligned / (1024 * 1024));
+    }
+}
+
+size_t mmap_offset(const void *ptr) {
+    return (const char *)ptr - (const char *)g_mmap_base;
+}
 
 /* GPU-shared memory tracking (zero-copy between CPU and GPU) */
 #define SHARED_ALLOC_MAX 8
@@ -417,7 +468,7 @@ static weight_cache_entry_t g_weight_cache[WEIGHT_CACHE_SIZE];
 static int g_weight_cache_count = 0;
 static pthread_mutex_t g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static id<MTLBuffer> get_cached_weight_buffer(const float *weights, size_t size) {
+id<MTLBuffer> get_cached_weight_buffer(const float *weights, size_t size) {
     pthread_mutex_lock(&g_cache_mutex);
 
     for (int i = 0; i < g_weight_cache_count; i++) {
@@ -507,7 +558,7 @@ static pool_buffer_t g_activation_pool[ACTIVATION_POOL_SIZE];
 static int g_pool_count = 0;
 static pthread_mutex_t g_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static id<MTLBuffer> pool_get_buffer(size_t size) {
+id<MTLBuffer> pool_get_buffer(size_t size) {
     pthread_mutex_lock(&g_pool_mutex);
 
     for (int i = 0; i < g_pool_count; i++) {
@@ -543,7 +594,7 @@ static id<MTLBuffer> pool_get_buffer(size_t size) {
     return [g_device newBufferWithLength:size options:MTLResourceStorageModeShared];
 }
 
-static void pool_release_buffer(id<MTLBuffer> buffer) {
+void pool_release_buffer(id<MTLBuffer> buffer) {
     if (!buffer) return;
     pthread_mutex_lock(&g_pool_mutex);
     for (int i = 0; i < g_pool_count; i++) {
@@ -739,6 +790,18 @@ static int init_shaders(void) {
         func = [g_shader_library newFunctionWithName:@"decoder_wo_residual_q8"];
         if (func) g_decoder_wo_residual_q8_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
 
+        func = [g_shader_library newFunctionWithName:@"matmul_q8"];
+        if (func) g_matmul_q8_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+
+        func = [g_shader_library newFunctionWithName:@"matmul_q8_residual"];
+        if (func) g_matmul_q8_residual_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+
+        func = [g_shader_library newFunctionWithName:@"matmul_q8_tiled"];
+        if (func) g_matmul_q8_tiled_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+
+        func = [g_shader_library newFunctionWithName:@"matmul_q8_tiled_residual"];
+        if (func) g_matmul_q8_tiled_residual_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+
         g_shaders_initialized = 1;
 
         if (vox_verbose >= 2) {
@@ -840,6 +903,10 @@ void vox_metal_shutdown(void) {
         g_decoder_ffn_gate_q8_pipeline = nil;
         g_decoder_w2_residual_q8_pipeline = nil;
         g_decoder_wo_residual_q8_pipeline = nil;
+        g_matmul_q8_pipeline = nil;
+        g_matmul_q8_residual_pipeline = nil;
+        g_matmul_q8_tiled_pipeline = nil;
+        g_matmul_q8_tiled_residual_pipeline = nil;
 
         /* Release shared allocs */
         for (int i = 0; i < g_shared_count; i++)
@@ -2805,7 +2872,7 @@ void vox_metal_shared_free(void *ptr) {
     free(ptr); /* fallback: not a shared allocation */
 }
 
-static id<MTLBuffer> find_shared_buffer(void *ptr) {
+id<MTLBuffer> find_shared_buffer(void *ptr) {
     for (int i = 0; i < g_shared_count; i++) {
         if (g_shared_allocs[i].ptr == ptr) return g_shared_allocs[i].buf;
     }
@@ -2823,6 +2890,10 @@ int vox_metal_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *l
 
     vox_ctx_t *ctx = (vox_ctx_t *)ctx_ptr;
     vox_decoder_t *dec = &ctx->decoder;
+
+    /* Route to native Q8 path when mmap buffer is available */
+    if (g_mmap_buffer && dec->layers[0].w1_weight_q8)
+        return vox_metal_decoder_full_step_q8(ctx_ptr, rope_freqs, logits_out);
 
     int dim = VOX_DEC_DIM;
     int n_heads = VOX_DEC_HEADS;
@@ -3112,6 +3183,10 @@ int vox_metal_encoder_full_step(void *ctx_ptr, float *x, int new_len,
 
     vox_ctx_t *ctx = (vox_ctx_t *)ctx_ptr;
     vox_encoder_t *enc = &ctx->encoder;
+
+    /* Route to native Q8 path when mmap buffer is available */
+    if (g_mmap_buffer && enc->layers[0].wq_weight_q8)
+        return vox_metal_encoder_full_step_q8(ctx_ptr, x, new_len, rope_freqs, cache_len);
 
     int dim = VOX_ENC_DIM;          /* 1280 */
     int n_heads = VOX_ENC_HEADS;    /* 32 */
@@ -3683,6 +3758,12 @@ void vox_metal_decoder_prefill_step(void *ctx_ptr, float *x, int seq_len,
 
     vox_ctx_t *ctx = (vox_ctx_t *)ctx_ptr;
     vox_decoder_t *dec = &ctx->decoder;
+
+    /* Route to native Q8 path when mmap buffer is available */
+    if (g_mmap_buffer && dec->layers[0].w1_weight_q8) {
+        vox_metal_decoder_prefill_step_q8(ctx_ptr, x, seq_len, rope_freqs);
+        return;
+    }
 
     int dim = VOX_DEC_DIM;          /* 3072 */
     int n_heads = VOX_DEC_HEADS;    /* 32 */

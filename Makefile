@@ -71,7 +71,7 @@ mps: clean mps-build
 	@echo ""
 	@echo "Built with MPS backend (Metal GPU acceleration)"
 
-mps-build: $(SRCS:.c=.mps.o) voxtral_metal.o main.mps.o
+mps-build: $(SRCS:.c=.mps.o) voxtral_metal.o voxtral_metal_q8.o main.mps.o
 	$(CC) $(MPS_CFLAGS) -o $(TARGET) $^ $(MPS_LDFLAGS)
 
 %.mps.o: %.c voxtral.h voxtral_kernels.h
@@ -81,7 +81,10 @@ mps-build: $(SRCS:.c=.mps.o) voxtral_metal.o main.mps.o
 voxtral_shaders_source.h: voxtral_shaders.metal
 	xxd -i $< > $@
 
-voxtral_metal.o: voxtral_metal.m voxtral_metal.h voxtral_shaders_source.h
+voxtral_metal.o: voxtral_metal.m voxtral_metal.h voxtral_metal_internal.h voxtral_shaders_source.h
+	$(CC) $(MPS_OBJCFLAGS) -c -o $@ $<
+
+voxtral_metal_q8.o: voxtral_metal_q8.m voxtral_metal_internal.h voxtral.h
 	$(CC) $(MPS_OBJCFLAGS) -c -o $@ $<
 
 else

@@ -1240,18 +1240,29 @@ kernel void decoder_wo_residual(
     }
 }
 
+/* Helper: read float from potentially unaligned device memory (little-endian) */
+inline float read_float_ua(device const char *p) {
+    device const uchar *b = (device const uchar *)p;
+    uint bits = (uint)b[0] | ((uint)b[1] << 8) | ((uint)b[2] << 16) | ((uint)b[3] << 24);
+    return as_type<float>(bits);
+}
+
 /* ========================================================================
  * Q8 Decoder FFN gate+up kernel (M=1):
  * out[h] = silu(dot(x, w1_q8[h]) * s1[h]) * (dot(x, w3_q8[h]) * s3[h])
+ * w1 and w3 are separate buffers (not merged).
  * ======================================================================== */
 
 kernel void decoder_ffn_gate_q8(
     device const float *x [[buffer(0)]],
-    device const char *w_merged_q8 [[buffer(1)]],
-    device const float *scales [[buffer(2)]],
-    device float *out [[buffer(3)]],
-    constant int &dim [[buffer(4)]],
-    constant int &hidden [[buffer(5)]],
+    device const char *mmap_buf [[buffer(1)]],
+    device float *out [[buffer(5)]],
+    constant int &dim [[buffer(6)]],
+    constant int &hidden [[buffer(7)]],
+    constant ulong &w1_offset [[buffer(8)]],
+    constant ulong &w1s_offset [[buffer(9)]],
+    constant ulong &w3_offset [[buffer(10)]],
+    constant ulong &w3s_offset [[buffer(11)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -1260,18 +1271,21 @@ kernel void decoder_ffn_gate_q8(
 ) {
     if ((int)row >= hidden) return;
 
-    device const char *w1 = w_merged_q8 + (long)row * dim;
-    device const char *w3 = w_merged_q8 + (long)(row + hidden) * dim;
+    device const char *w1_q8 = mmap_buf + w1_offset;
+    device const char *w1s_base = mmap_buf + w1s_offset;
+    device const char *w3_q8 = mmap_buf + w3_offset;
+    device const char *w3s_base = mmap_buf + w3s_offset;
+
+    device const char *w1 = w1_q8 + (long)row * dim;
+    device const char *w3 = w3_q8 + (long)row * dim;
 
     float sum1 = 0.0f;
     float sum3 = 0.0f;
     int i = (int)tid * 4;
     for (; i + 3 < dim; i += (int)tg_size * 4) {
         float4 xv = float4(x[i], x[i + 1], x[i + 2], x[i + 3]);
-        char4 w1v = *((device const char4 *)(w1 + i));
-        char4 w3v = *((device const char4 *)(w3 + i));
-        sum1 += dot(xv, float4(w1v));
-        sum3 += dot(xv, float4(w3v));
+        sum1 += xv.x * float(w1[i]) + xv.y * float(w1[i+1]) + xv.z * float(w1[i+2]) + xv.w * float(w1[i+3]);
+        sum3 += xv.x * float(w3[i]) + xv.y * float(w3[i+1]) + xv.z * float(w3[i+2]) + xv.w * float(w3[i+3]);
     }
     for (; i < dim; i += (int)tg_size) {
         float xv = x[i];
@@ -1299,10 +1313,331 @@ kernel void decoder_ffn_gate_q8(
             d1 += tg_s1[g];
             d3 += tg_s3[g];
         }
-        d1 *= scales[row];           // w1 scale
-        d3 *= scales[row + hidden];  // w3 scale
+        d1 *= read_float_ua(w1s_base + (int)row * 4);
+        d3 *= read_float_ua(w3s_base + (int)row * 4);
         float gate = d1 / (1.0f + exp(-d1));
         out[row] = gate * d3;
+    }
+}
+
+/* ========================================================================
+ * General Q8 GEMM:
+ * C[m, c_stride*m + c_col_off + n] = sum_k(A[m, a_stride*m + k] * W[n, k]) * scales[n]
+ * One threadgroup per (m, n) output element.
+ * 256 threads split K via char4/float4 + simd_sum + tg reduction.
+ * ======================================================================== */
+
+kernel void matmul_q8(
+    device const float *A [[buffer(0)]],
+    device const char  *mmap_buf [[buffer(1)]],
+    device float       *C [[buffer(3)]],
+    constant int &M [[buffer(4)]],
+    constant int &N [[buffer(5)]],
+    constant int &K [[buffer(6)]],
+    constant int &a_stride [[buffer(7)]],
+    constant int &c_stride [[buffer(8)]],
+    constant int &c_col_off [[buffer(9)]],
+    constant ulong &w_offset [[buffer(10)]],
+    constant ulong &s_offset [[buffer(11)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]
+) {
+    int n = (int)gid % N;
+    int m = (int)gid / N;
+    if (m >= M || n >= N) return;
+
+    device const float *a_row = A + (long)m * a_stride;
+    device const char *W_q8 = mmap_buf + w_offset;
+    device const char *s_base = mmap_buf + s_offset;
+    device const char *w_row = W_q8 + (long)n * K;
+
+    float sum = 0.0f;
+    int i = (int)tid * 4;
+    for (; i + 3 < K; i += 256 * 4) {
+        float4 av = float4(a_row[i], a_row[i + 1], a_row[i + 2], a_row[i + 3]);
+        sum += av.x * float(w_row[i]) + av.y * float(w_row[i+1])
+             + av.z * float(w_row[i+2]) + av.w * float(w_row[i+3]);
+    }
+    for (; i < K; i += 256) {
+        sum += a_row[i] * float(w_row[i]);
+    }
+
+    float s = simd_sum(sum);
+
+    const int max_simd_groups = 8;
+    threadgroup float tg_s[max_simd_groups];
+    if (simd_lid == 0) tg_s[simd_gid] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float d = 0.0f;
+        for (int g = 0; g < max_simd_groups; g++) d += tg_s[g];
+        C[(long)m * c_stride + c_col_off + n] = d * read_float_ua(s_base + n * 4);
+    }
+}
+
+/* Same as matmul_q8 but accumulates: C[...] += result */
+kernel void matmul_q8_residual(
+    device const float *A [[buffer(0)]],
+    device const char  *mmap_buf [[buffer(1)]],
+    device float       *C [[buffer(3)]],
+    constant int &M [[buffer(4)]],
+    constant int &N [[buffer(5)]],
+    constant int &K [[buffer(6)]],
+    constant int &a_stride [[buffer(7)]],
+    constant int &c_stride [[buffer(8)]],
+    constant int &c_col_off [[buffer(9)]],
+    constant ulong &w_offset [[buffer(10)]],
+    constant ulong &s_offset [[buffer(11)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]
+) {
+    int n = (int)gid % N;
+    int m = (int)gid / N;
+    if (m >= M || n >= N) return;
+
+    device const float *a_row = A + (long)m * a_stride;
+    device const char *W_q8 = mmap_buf + w_offset;
+    device const char *s_base = mmap_buf + s_offset;
+    device const char *w_row = W_q8 + (long)n * K;
+
+    float sum = 0.0f;
+    int i = (int)tid * 4;
+    for (; i + 3 < K; i += 256 * 4) {
+        float4 av = float4(a_row[i], a_row[i + 1], a_row[i + 2], a_row[i + 3]);
+        sum += av.x * float(w_row[i]) + av.y * float(w_row[i+1])
+             + av.z * float(w_row[i+2]) + av.w * float(w_row[i+3]);
+    }
+    for (; i < K; i += 256) {
+        sum += a_row[i] * float(w_row[i]);
+    }
+
+    float s = simd_sum(sum);
+
+    const int max_simd_groups = 8;
+    threadgroup float tg_s[max_simd_groups];
+    if (simd_lid == 0) tg_s[simd_gid] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float d = 0.0f;
+        for (int g = 0; g < max_simd_groups; g++) d += tg_s[g];
+        C[(long)m * c_stride + c_col_off + n] += d * read_float_ua(s_base + n * 4);
+    }
+}
+
+/* ========================================================================
+ * Tiled Q8 matmul for M > 1 (register-tiled):
+ * C[M,N] = A[M,K] @ W_q8[N,K]^T * scales[N]
+ *
+ * Tile: BM=16, BN=32, BK=64, TM=2, 256 threads/threadgroup.
+ * Thread mapping: trow = tid / 32 (0..7), tcol = tid % 32 (0..31).
+ * Each thread accumulates TM=2 output rows for 1 column.
+ * sB padded to stride 68 to eliminate bank conflicts:
+ *   bank(n) = (n * 17) % 32 → all unique for n=0..31.
+ * Grid: (ceil(N/32), ceil(M/16), 1).
+ * ======================================================================== */
+
+kernel void matmul_q8_tiled(
+    device const float *A [[buffer(0)]],
+    device const char  *mmap_buf [[buffer(1)]],
+    device float       *C [[buffer(3)]],
+    constant int &M [[buffer(4)]],
+    constant int &N [[buffer(5)]],
+    constant int &K [[buffer(6)]],
+    constant int &a_stride [[buffer(7)]],
+    constant int &c_stride [[buffer(8)]],
+    constant int &c_col_off [[buffer(9)]],
+    constant ulong &w_offset [[buffer(10)]],
+    constant ulong &s_offset [[buffer(11)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    const int BM = 16;
+    const int BN = 32;
+    const int BK = 64;
+    const int TM = 2;
+    const int SB_STRIDE = BK + 4; /* 68: padding eliminates bank conflicts */
+
+    int row0 = (int)group_id.y * BM;
+    int col0 = (int)group_id.x * BN;
+
+    int trow = (int)tid / BN;   /* 0..7  */
+    int tcol = (int)tid % BN;   /* 0..31 */
+
+    device const float *A_base = A;
+    device const char *W_q8 = mmap_buf + w_offset;
+    device const char *s_base = mmap_buf + s_offset;
+
+    threadgroup float sA[BM][BK];            /* 16 * 64 * 4 = 4 KB */
+    threadgroup char  sB[BN][SB_STRIDE];     /* 32 * 68     = 2.1 KB */
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        /* Cooperative load A tile: 1024 floats, 4 per thread */
+        {
+            int idx = (int)tid * 4;
+            int am = idx / BK;       /* row within tile: 0..15 */
+            int ak = idx % BK;       /* col within tile: 0,4,8,...,60 */
+            int gm = row0 + am;
+            int gk = k0 + ak;
+            bool valid_m = (gm < M);
+            sA[am][ak]     = (valid_m && gk < K)     ? A_base[(long)gm * a_stride + gk]     : 0.0f;
+            sA[am][ak + 1] = (valid_m && gk + 1 < K) ? A_base[(long)gm * a_stride + gk + 1] : 0.0f;
+            sA[am][ak + 2] = (valid_m && gk + 2 < K) ? A_base[(long)gm * a_stride + gk + 2] : 0.0f;
+            sA[am][ak + 3] = (valid_m && gk + 3 < K) ? A_base[(long)gm * a_stride + gk + 3] : 0.0f;
+        }
+
+        /* Cooperative load B tile: 2048 chars, 8 per thread */
+        {
+            int idx = (int)tid * 8;
+            int bn = idx / BK;       /* row within tile: 0..31 */
+            int bk = idx % BK;       /* col within tile: 0,8,...,56 */
+            int gn = col0 + bn;
+            int gk = k0 + bk;
+            device const char *w_row = W_q8 + (long)gn * K;
+            bool valid_n = (gn < N);
+            for (int j = 0; j < 8; j++) {
+                sB[bn][bk + j] = (valid_n && gk + j < K) ? w_row[gk + j] : 0;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* Inner loop: each thread computes TM=2 outputs, 4-wide vectorized.
+         * sA reads are broadcasts (all threads in simdgroup share trow).
+         * sB reads are conflict-free thanks to stride-68 padding. */
+        int r0 = trow * TM;
+        int klen = min(BK, K - k0);
+        int kk = 0;
+        for (; kk + 3 < klen; kk += 4) {
+            float4 a0 = float4(sA[r0][kk], sA[r0][kk+1],
+                               sA[r0][kk+2], sA[r0][kk+3]);
+            float4 a1 = float4(sA[r0+1][kk], sA[r0+1][kk+1],
+                               sA[r0+1][kk+2], sA[r0+1][kk+3]);
+            float4 bv = float4((float)sB[tcol][kk], (float)sB[tcol][kk+1],
+                               (float)sB[tcol][kk+2], (float)sB[tcol][kk+3]);
+            acc0 += a0.x * bv.x + a0.y * bv.y + a0.z * bv.z + a0.w * bv.w;
+            acc1 += a1.x * bv.x + a1.y * bv.y + a1.z * bv.z + a1.w * bv.w;
+        }
+        for (; kk < klen; kk++) {
+            float bval = (float)sB[tcol][kk];
+            acc0 += sA[r0][kk] * bval;
+            acc1 += sA[r0+1][kk] * bval;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    /* Write TM=2 results with per-channel scale */
+    int global_n = col0 + tcol;
+    if (global_n < N) {
+        float scale = read_float_ua(s_base + global_n * 4);
+        int base_m = row0 + trow * TM;
+        if (base_m < M)     C[(long)(base_m)     * c_stride + c_col_off + global_n] = acc0 * scale;
+        if (base_m + 1 < M) C[(long)(base_m + 1) * c_stride + c_col_off + global_n] = acc1 * scale;
+    }
+}
+
+/* Same as matmul_q8_tiled but accumulates: C[...] += result */
+kernel void matmul_q8_tiled_residual(
+    device const float *A [[buffer(0)]],
+    device const char  *mmap_buf [[buffer(1)]],
+    device float       *C [[buffer(3)]],
+    constant int &M [[buffer(4)]],
+    constant int &N [[buffer(5)]],
+    constant int &K [[buffer(6)]],
+    constant int &a_stride [[buffer(7)]],
+    constant int &c_stride [[buffer(8)]],
+    constant int &c_col_off [[buffer(9)]],
+    constant ulong &w_offset [[buffer(10)]],
+    constant ulong &s_offset [[buffer(11)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    const int BM = 16;
+    const int BN = 32;
+    const int BK = 64;
+    const int TM = 2;
+    const int SB_STRIDE = BK + 4;
+
+    int row0 = (int)group_id.y * BM;
+    int col0 = (int)group_id.x * BN;
+
+    int trow = (int)tid / BN;
+    int tcol = (int)tid % BN;
+
+    device const float *A_base = A;
+    device const char *W_q8 = mmap_buf + w_offset;
+    device const char *s_base = mmap_buf + s_offset;
+
+    threadgroup float sA[BM][BK];
+    threadgroup char  sB[BN][SB_STRIDE];
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        {
+            int idx = (int)tid * 4;
+            int am = idx / BK;
+            int ak = idx % BK;
+            int gm = row0 + am;
+            int gk = k0 + ak;
+            bool valid_m = (gm < M);
+            sA[am][ak]     = (valid_m && gk < K)     ? A_base[(long)gm * a_stride + gk]     : 0.0f;
+            sA[am][ak + 1] = (valid_m && gk + 1 < K) ? A_base[(long)gm * a_stride + gk + 1] : 0.0f;
+            sA[am][ak + 2] = (valid_m && gk + 2 < K) ? A_base[(long)gm * a_stride + gk + 2] : 0.0f;
+            sA[am][ak + 3] = (valid_m && gk + 3 < K) ? A_base[(long)gm * a_stride + gk + 3] : 0.0f;
+        }
+
+        {
+            int idx = (int)tid * 8;
+            int bn = idx / BK;
+            int bk = idx % BK;
+            int gn = col0 + bn;
+            int gk = k0 + bk;
+            device const char *w_row = W_q8 + (long)gn * K;
+            bool valid_n = (gn < N);
+            for (int j = 0; j < 8; j++) {
+                sB[bn][bk + j] = (valid_n && gk + j < K) ? w_row[gk + j] : 0;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        int r0 = trow * TM;
+        int klen = min(BK, K - k0);
+        int kk = 0;
+        for (; kk + 3 < klen; kk += 4) {
+            float4 a0 = float4(sA[r0][kk], sA[r0][kk+1],
+                               sA[r0][kk+2], sA[r0][kk+3]);
+            float4 a1 = float4(sA[r0+1][kk], sA[r0+1][kk+1],
+                               sA[r0+1][kk+2], sA[r0+1][kk+3]);
+            float4 bv = float4((float)sB[tcol][kk], (float)sB[tcol][kk+1],
+                               (float)sB[tcol][kk+2], (float)sB[tcol][kk+3]);
+            acc0 += a0.x * bv.x + a0.y * bv.y + a0.z * bv.z + a0.w * bv.w;
+            acc1 += a1.x * bv.x + a1.y * bv.y + a1.z * bv.z + a1.w * bv.w;
+        }
+        for (; kk < klen; kk++) {
+            float bval = (float)sB[tcol][kk];
+            acc0 += sA[r0][kk] * bval;
+            acc1 += sA[r0+1][kk] * bval;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    int global_n = col0 + tcol;
+    if (global_n < N) {
+        float scale = read_float_ua(s_base + global_n * 4);
+        int base_m = row0 + trow * TM;
+        if (base_m < M)     C[(long)(base_m)     * c_stride + c_col_off + global_n] += acc0 * scale;
+        if (base_m + 1 < M) C[(long)(base_m + 1) * c_stride + c_col_off + global_n] += acc1 * scale;
     }
 }
 
@@ -1332,8 +1667,8 @@ kernel void decoder_w2_residual_q8(
     int i = (int)tid * 4;
     for (; i + 3 < hidden; i += (int)tg_size * 4) {
         float4 gv = float4(gate[i], gate[i + 1], gate[i + 2], gate[i + 3]);
-        char4 wv = *((device const char4 *)(w + i));
-        sum += dot(gv, float4(wv));
+        sum += gv.x * float(w[i]) + gv.y * float(w[i+1])
+             + gv.z * float(w[i+2]) + gv.w * float(w[i+3]);
     }
     for (; i < hidden; i += (int)tg_size) {
         sum += gate[i] * float(w[i]);
@@ -1380,8 +1715,8 @@ kernel void decoder_wo_residual_q8(
     int i = (int)tid * 4;
     for (; i + 3 < q_dim; i += (int)tg_size * 4) {
         float4 av = float4(attn[i], attn[i + 1], attn[i + 2], attn[i + 3]);
-        char4 wv = *((device const char4 *)(w + i));
-        sum += dot(av, float4(wv));
+        sum += av.x * float(w[i]) + av.y * float(w[i+1])
+             + av.z * float(w[i+2]) + av.w * float(w[i+3]);
     }
     for (; i < q_dim; i += (int)tg_size) {
         sum += attn[i] * float(w[i]);

@@ -223,7 +223,7 @@ safetensors_file_t *safetensors_open(const char *path) {
         return NULL;
     }
 
-    void *data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    void *data = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
     close(fd);
 
     if (data == MAP_FAILED) {

@@ -38,6 +38,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --monitor     Show non-intrusive symbols inline with output (stderr)\n");
     fprintf(stderr, "  --debug       Debug output (per-layer, per-chunk details)\n");
     fprintf(stderr, "  --silent      No status output (only transcription on stdout)\n");
+    fprintf(stderr, "  --preload     Preload Q8 weights into GPU memory (higher RAM, no page faults)\n");
     fprintf(stderr, "  -h            Show this help\n");
 }
 
@@ -153,6 +154,8 @@ int main(int argc, char **argv) {
             verbosity = 2;
         } else if (strcmp(argv[i], "--silent") == 0) {
             verbosity = 0;
+        } else if (strcmp(argv[i], "--preload") == 0) {
+            setenv("VOX_Q8_PRELOAD", "1", 1);
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
